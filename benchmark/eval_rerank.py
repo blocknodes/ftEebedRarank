@@ -18,13 +18,16 @@ def evaluate_retrieval_performance(data, output_dir, score_threshold=0.0):
     # 确保输出目录存在
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    # 定义输出文件路径
-    goodcase_path = os.path.join(output_dir, "goodcase.jsonl")
-    badcase_path = os.path.join(output_dir, "badcase.jsonl")
+    # 定义输出文件路径 - 标准格式和可读性强的格式
+    goodcase_std_path = os.path.join(output_dir, "goodcase.jsonl")
+    goodcase_readable_path = os.path.join(output_dir, "goodcase_readable.jsonl")
+    badcase_std_path = os.path.join(output_dir, "badcase.jsonl")
+    badcase_readable_path = os.path.join(output_dir, "badcase_readable.jsonl")
     result_path = os.path.join(output_dir, "evaluation_result.json")
 
     # 清空之前的结果文件
-    for path in [goodcase_path, badcase_path, result_path]:
+    for path in [goodcase_std_path, goodcase_readable_path,
+                 badcase_std_path, badcase_readable_path, result_path]:
         if os.path.exists(path):
             os.remove(path)
 
@@ -34,27 +37,34 @@ def evaluate_retrieval_performance(data, output_dir, score_threshold=0.0):
         retrieved_docs = d.get("rank", [])  # 召回结果列表
         doc_scores = d.get("score", [])    # 召回结果对应的分数列表
 
-        # 过滤掉分数低于阈值的召回结果
+        # 过滤掉分数低于阈值的召回结果，同时保留分数信息
         filtered_recalls = []
+        filtered_scores = []
         if doc_scores and len(doc_scores) == len(retrieved_docs):
             for doc, score in zip(retrieved_docs, doc_scores):
                 if score >= score_threshold:
                     filtered_recalls.append(doc)
+                    filtered_scores.append(score)
                 else:
                     filtered_count += 1
         else:
             # 如果没有分数信息，使用所有召回结果
-            raise
             filtered_recalls = retrieved_docs
+            filtered_scores = [None] * len(retrieved_docs)
 
         pos = []
-        recall = []
+        recall_with_scores = []  # 包含分数的召回结果（仅保留此信息）
 
         for doc in relevant_docs:
             pos.append(after_first_newline(doc)+'\n')
 
-        for doc in filtered_recalls:
-            recall.append(after_first_newline(doc))
+        # 处理召回结果，仅生成带分数的版本
+        for doc, score in zip(filtered_recalls, filtered_scores):
+            doc_content = after_first_newline(doc)
+            recall_with_scores.append({
+                "content": doc_content,
+                "score": score
+            })
 
         if not query or not pos:
             continue
@@ -64,8 +74,8 @@ def evaluate_retrieval_performance(data, output_dir, score_threshold=0.0):
         # 计算 Top1 命中
         top1_hit = 0
         pos_texts = [p.replace(' ', '') for p in pos]
-        if recall:  # 检查召回结果是否为空
-            first_recall = recall[0].replace(' ', '')
+        if recall_with_scores:  # 检查召回结果是否为空
+            first_recall = recall_with_scores[0]["content"].replace(' ', '')
             if first_recall in pos_texts:
                 top1_hit = 1
         top1_hits += top1_hit
@@ -74,34 +84,41 @@ def evaluate_retrieval_performance(data, output_dir, score_threshold=0.0):
         top3_hit = 0
         min_rank = float('inf')
         # 只检查前3个召回结果
-        for rank, item in enumerate(recall[:3], 1):
-            item_clean = item.replace(' ', '')
+        for rank, item in enumerate(recall_with_scores[:3], 1):
+            item_clean = item["content"].replace(' ', '')
             if item_clean in pos_texts:
                 top3_hit = 1
                 if rank < min_rank:
                     min_rank = rank
 
+        # 准备要写入的案例数据（只包含带分数的召回结果）
+        case_item = {
+            "query": query,
+            "pos": pos,
+            "recall_with_scores": recall_with_scores[:10],  # 仅保留带分数的召回结果
+            "top1_hit": top1_hit,
+            "top3_hit": top3_hit
+        }
+
         if top3_hit:
             top3_hits += 1
             mrr_sum += 1.0 / min_rank
 
-            # 记录好案例
-            good_item = {
-                "query": query,
-                "pos": pos,
-                "recall": recall[:10]
-            }
-            with open(goodcase_path, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(good_item, ensure_ascii=False) + '\n')
+            # 记录好案例 - 标准格式
+            with open(goodcase_std_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(case_item, ensure_ascii=False) + '\n')
+
+            # 记录好案例 - 可读性强的格式
+            with open(goodcase_readable_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(case_item, ensure_ascii=False, indent=2) + '\n')
         else:
-            # 记录坏案例
-            bad_item = {
-                "query": query,
-                "pos": pos,
-                "recall": recall[:10]
-            }
-            with open(badcase_path, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(bad_item, ensure_ascii=False) + '\n')
+            # 记录坏案例 - 标准格式
+            with open(badcase_std_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(case_item, ensure_ascii=False) + '\n')
+
+            # 记录坏案例 - 可读性强的格式
+            with open(badcase_readable_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(case_item, ensure_ascii=False, indent=2) + '\n')
 
     # 计算指标
     top1_hit_rate = top1_hits / total_queries if total_queries > 0 else 0
