@@ -502,59 +502,82 @@ if __name__ == "__main__":
     query = sys.argv[1]
     #### query rewrite ####
     new_query = qeury_rewrite(query)
+    if not new_query:
+        print("查询优化失败，无法继续", file=sys.stderr)
+        sys.exit(1)
 
     #### vectorize #####
     vectors = vectorize_text([new_query])
+    if not vectors or 'data' not in vectors or not vectors['data']:
+        print("向量转换失败，无法继续", file=sys.stderr)
+        sys.exit(1)
+    query_vector = vectors['data'][0]['value']
 
-    ##### es search #####
-    results = search_elasticsearch(vectors['data'][0]['value'], new_query)
-
-    ### we only needs segments
+    ##### 初始化存储结构 #####
     segments = set()
+    segments2file = {}
 
-    segments2file={}
+    def process_items(items):
+        """处理检索结果条目，过滤无效数据并提取segment信息"""
+        if not isinstance(items, list):  # 确保输入是列表
+            return
+        for item in items:
+            # 校验item是否为字典且包含必要字段
+            if not isinstance(item, dict) or 'content' not in item or 'block_id' not in item:
+                print(f"无效的条目格式: {item}，跳过处理", file=sys.stderr)
+                continue
+            content = item['content']
+            block_id = item['block_id']
+            segments.add(content)
+            if content not in segments2file:
+                segments2file[content] = get_filename_by_block_id(block_id)
 
-    for hit in results:
-        result = query_es_by_segment_id(hit['segment_id'],hit['dir_id'])
-        for item in result:
-            segments.add(item['content'])
-            if item['content'] not in segments2file.keys():
-                segments2file[item['content']] = get_filename_by_block_id(item['block_id'])
-            #blockids.add(item['block_id'])
+    ##### 第一阶段：sentence级检索→转换为segment #####
+    sentence_results = search_elasticsearch(query_vector, new_query)
+    if sentence_results and isinstance(sentence_results, list):
+        for hit in sentence_results:
+            # 校验hit是否包含必要的segment_id和dir_id
+            if not isinstance(hit, dict) or 'segment_id' not in hit or 'dir_id' not in hit:
+                print(f"无效的sentence结果: {hit}，跳过处理", file=sys.stderr)
+                continue
+            segment_result = query_es_by_segment_id(hit['segment_id'], hit['dir_id'])
+            process_items(segment_result)  # 统一处理segment结果
 
+    ##### 第二阶段：直接检索segments #####
+    direct_segment_results = search_segments_from_elasticsearch(query_vector, new_query)
+    process_items(direct_segment_results)  # 统一处理直接检索的segment结果
 
+    ##### 重排序及结果整理 #####
+    if not segments:
+        print("未检索到有效片段", file=sys.stderr)
+        sys.exit(1)
 
-    ##### search segments directly
-    result = search_segments_from_elasticsearch(vectors['data'][0]['value'], new_query)
-
-    for hit in result:
-        segments.add(hit['content'])
-        if hit['content'] not in segments2file.keys():
-            segments2file[hit['content']] = get_filename_by_block_id(hit['block_id'])
-        #blockids.add(item['block_id'])
-
-
-
-
-    print(segments2file)
     docs = list(segments)
-    result = call_rerank_api(new_query, docs)
-    # 提取分数和索引信息
-    scores_with_index = result["data"][0]["value"]
+    rerank_result = call_rerank_api(new_query, docs)
+    if not rerank_result or 'data' not in rerank_result or not rerank_result['data']:
+        print("重排序失败，无法继续", file=sys.stderr)
+        sys.exit(1)
 
-    # 创建一个包含文档、索引和分数的列表
+    scores_with_index = rerank_result["data"][0]["value"]
     docs_with_scores = []
     for item in scores_with_index:
+        if not isinstance(item, dict) or 'index' not in item or 'relevance_score' not in item:
+            print(f"无效的重排序结果: {item}，跳过处理", file=sys.stderr)
+            continue
         idx = item["index"]
-        score = item["relevance_score"]
+        if idx < 0 or idx >= len(docs):  # 校验索引有效性
+            print(f"无效的文档索引: {idx}，跳过处理", file=sys.stderr)
+            continue
         docs_with_scores.append({
             "document": docs[idx],
-            "relevance_score": score,
-            "filename":segments2file[docs[idx]]
+            "relevance_score": item["relevance_score"],
+            "filename": segments2file.get(docs[idx], "未知文件名")
         })
 
-    # 按照相关性分数升序排列
-    sorted_docs = sorted(docs_with_scores, key=lambda x: x["relevance_score"], reverse=True )
+    # 按相关性降序排列
+    sorted_docs = sorted(docs_with_scores, key=lambda x: x["relevance_score"], reverse=True)
+
+
 
     result={'orig_query':query,'new_query':new_query,'retrieved_docs':sorted_docs}
     json_str = json.dumps(result, indent=2, ensure_ascii=False)
