@@ -2,6 +2,47 @@ import sys
 import requests
 import json
 
+def get_filename_by_block_id(target_block_id):
+    # 配置信息
+    es_url = "http://10.18.219.171:9200"
+    index_name = "block-data-prod-000001"
+    username = "elastic"
+    password = "8ktbepQdRJVWjw@B"
+    #target_block_id = "6f4d3b9457e140cfafc5561930ddf845"  # 目标block_id
+
+    # 构建请求
+    url = f"{es_url}/{index_name}/_search"
+    query_body = {
+        "query": {
+            "term": {
+                "block_id": {
+                    "value": target_block_id
+                }
+            }
+        },
+        "_source": ["fileName"]
+    }
+
+    try:
+        response = requests.get(
+            url,
+            json=query_body,
+            auth=(username, password),
+            params={"pretty": "true"}
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        # 处理结果
+        if result["hits"]["total"]["value"] > 0:
+            return result["hits"]["hits"][0]["_source"].get("fileName")
+        else:
+            return f"未找到block_id为 {target_block_id} 的记录"
+
+    except requests.exceptions.RequestException as e:
+        return f"查询出错: {str(e)}"
+
+
 def search_segments_from_elasticsearch(query_vector, query_string):
     """
     发送KNN查询到Elasticsearch
@@ -466,17 +507,20 @@ if __name__ == "__main__":
     vectors = vectorize_text([new_query])
 
     ##### es search #####
-    result = search_elasticsearch(vectors['data'][0]['value'], new_query)
+    results = search_elasticsearch(vectors['data'][0]['value'], new_query)
 
     ### we only needs segments
     segments = set()
 
+    segments2file={}
 
-    ##### rerank ######
-    for hit in result:
+    for hit in results:
         result = query_es_by_segment_id(hit['segment_id'],hit['dir_id'])
         for item in result:
             segments.add(item['content'])
+            if item['content'] not in segments2file.keys():
+                segments2file[item['content']] = get_filename_by_block_id(item['block_id'])
+            #blockids.add(item['block_id'])
 
 
 
@@ -485,8 +529,14 @@ if __name__ == "__main__":
 
     for hit in result:
         segments.add(hit['content'])
+        if hit['content'] not in segments2file.keys():
+            segments2file[hit['content']] = get_filename_by_block_id(hit['block_id'])
+        #blockids.add(item['block_id'])
 
-    print(segments)
+
+
+
+    print(segments2file)
     docs = list(segments)
     result = call_rerank_api(new_query, docs)
     # 提取分数和索引信息
@@ -499,7 +549,8 @@ if __name__ == "__main__":
         score = item["relevance_score"]
         docs_with_scores.append({
             "document": docs[idx],
-            "relevance_score": score
+            "relevance_score": score,
+            "filename":segments2file[docs[idx]]
         })
 
     # 按照相关性分数升序排列
