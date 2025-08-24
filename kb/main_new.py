@@ -1,8 +1,10 @@
 import sys
 import json
 import requests
+import os
 from datetime import datetime
 from time import sleep
+from tqdm import tqdm  # 导入tqdm库用于显示进度条
 
 # 配置信息集中管理
 CONFIG = {
@@ -351,19 +353,57 @@ def append_to_jsonl(file_path, data):
         data (dict): 要添加的数据，必须是可序列化为JSON的字典
     """
     try:
+        # 确保输出目录存在
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
         # 以追加模式打开文件，确保中文等特殊字符正确处理
         with open(file_path, 'a', encoding='utf-8') as f:
             # 将数据序列化为JSON字符串并写入，确保不添加多余空格
             json.dump(data, f, ensure_ascii=False)
             # 写入换行符，确保每条记录占一行
             f.write('\n')
-        print(f"成功向{file_path}添加一行数据")
     except Exception as e:
         print(f"操作失败: {str(e)}")
 
 
-# 新增：单独处理单个查询的函数（提取原有逻辑）
+def save_progress(progress_file, line_num):
+    """保存当前处理进度到文件"""
+    try:
+        # 先写入临时文件，成功后再替换，确保原子性
+        temp_file = f"{progress_file}.tmp"
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump({"last_processed_line": line_num}, f)
+
+        # 原子性替换文件
+        os.replace(temp_file, progress_file)
+    except Exception as e:
+        print(f"保存进度失败: {str(e)}", file=sys.stderr)
+
+
+def load_progress(progress_file):
+    """从文件加载上次处理进度"""
+    try:
+        if os.path.exists(progress_file):
+            with open(progress_file, 'r', encoding='utf-8') as f:
+                progress = json.load(f)
+                return progress.get("last_processed_line", 0)
+    except Exception as e:
+        print(f"加载进度失败，将从头开始: {str(e)}", file=sys.stderr)
+    return 0
+
+
+def count_total_lines(file_path):
+    """计算文件的总行数，用于进度条显示"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return sum(1 for line in f if line.strip())
+    except Exception as e:
+        print(f"计算总行数失败: {str(e)}", file=sys.stderr)
+        return 0
+
+
 def process_single_query(query, output_dir='output'):
+    """处理单个查询，返回处理是否成功"""
     # 1. 查询重写
     success = False
     for i in range(10):
@@ -377,12 +417,12 @@ def process_single_query(query, output_dir='output'):
 
     if not success:
         print("查询优化失败，无法继续", file=sys.stderr)
-        sys.exit(1)
+        return False  # 返回处理状态
     # 2. 文本向量化
     vectors = vectorize_text([new_query])
     if not vectors or 'data' not in vectors or not vectors['data']:
         print("向量转换失败，无法继续", file=sys.stderr)
-        sys.exit(1)
+        return False  # 返回处理状态
     query_vector = vectors['data'][0]['value']
 
     # 3. 初始化存储结构
@@ -399,6 +439,8 @@ def process_single_query(query, output_dir='output'):
                 continue
 
             segment_result = query_es_by_segment_id(hit['segment_id'], hit['dir_id'])
+            if not segment_result:
+                continue
 
             process_items(segment_result, segments, segments2file)
             item = {'sentence': hit['content'], 'sentence_score':hit['score'] ,
@@ -406,7 +448,7 @@ def process_single_query(query, output_dir='output'):
                     'segment_score':segment_result[0]['score'],
                     'file_name': segments2file[segment_result[0]['content']]}
             sentence_recall_result['value'].append(item)
-    # 按照sentence_score降序排列，如果需要按segment_score排序可以替换键
+    # 按照sentence_score降序排列
     sentence_recall_result['value'].sort(key=lambda x: x['sentence_score'], reverse=True)
     append_to_jsonl(f'{output_dir}/sentence_recall_result.jsonl', sentence_recall_result)
 
@@ -414,20 +456,21 @@ def process_single_query(query, output_dir='output'):
     # 5. 第二阶段：直接检索segments
     segment_recall_result={'query':query ,'query_rewritten': new_query,'value':[]}
     direct_segment_results = search_segments_from_elasticsearch(query_vector, new_query)
-    process_items(direct_segment_results, segments, segments2file)
-    for hit in direct_segment_results:
-        item = {'segment':hit['content'],
-                'segment_score': hit['score'],
-                'file_name': segments2file[hit['content']]}
-        segment_recall_result['value'].append(item)
-    segment_recall_result['value'].sort(key=lambda x: x['segment_score'], reverse=True)
-    append_to_jsonl(f'{output_dir}/segment_recall_result.jsonl', segment_recall_result)
+    if direct_segment_results:
+        process_items(direct_segment_results, segments, segments2file)
+        for hit in direct_segment_results:
+            item = {'segment':hit['content'],
+                    'segment_score': hit['score'],
+                    'file_name': segments2file.get(hit['content'], "未知文件名")}
+            segment_recall_result['value'].append(item)
+        segment_recall_result['value'].sort(key=lambda x: x['segment_score'], reverse=True)
+        append_to_jsonl(f'{output_dir}/segment_recall_result.jsonl', segment_recall_result)
 
 
     # 6. 重排序及结果整理
     if not segments:
         print("未检索到有效片段", file=sys.stderr)
-        sys.exit(1)
+        return False  # 返回处理状态
 
     docs = list(segments)
     success = False
@@ -442,7 +485,7 @@ def process_single_query(query, output_dir='output'):
 
     if not success:
         print("重排序失败，无法继续", file=sys.stderr)
-        sys.exit(1)
+        return False  # 返回处理状态
 
 
     scores_with_index = rerank_result["data"][0]["value"]
@@ -474,7 +517,7 @@ def process_single_query(query, output_dir='output'):
     }
 
     append_to_jsonl(f'{output_dir}/rerank_result.jsonl', result)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return True  # 处理成功
 
 
 def main():
@@ -483,26 +526,69 @@ def main():
         sys.exit(1)
 
     jsonl_path = sys.argv[1]
+    progress_file = f"{jsonl_path}.progress"
+
     try:
-        # 读取JSONL文件
+        # 计算总行数（仅非空行）
+        total_lines = count_total_lines(jsonl_path)
+        if total_lines == 0:
+            print("文件为空或无法读取", file=sys.stderr)
+            sys.exit(1)
+
+        # 加载上次处理进度
+        start_line = load_progress(progress_file)
+        remaining_lines = total_lines - start_line
+
+        # 读取JSONL文件并显示进度条
         with open(jsonl_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    # 解析JSON行，假设每行包含"query"字段
-                    data = json.loads(line)
-                    query = data.get('query')
-                    if not query:
-                        print(f"第{line_num}行缺少'query'字段，跳过", file=sys.stderr)
+            # 移动到上次处理的位置
+            for _ in range(start_line):
+                if not f.readline():  # 如果文件已读完
+                    if os.path.exists(progress_file):
+                        os.remove(progress_file)
+                    sys.exit(0)
+
+            # 初始化进度条，从start_line开始，总长度为total_lines
+            with tqdm(total=total_lines, initial=start_line, unit='行', desc='处理进度') as pbar:
+                for line_num, line in enumerate(f, start_line + 1):
+                    line = line.strip()
+                    if not line:
+                        # 空行也更新进度
+                        save_progress(progress_file, line_num)
+                        pbar.update(1)
                         continue
 
-                    # 处理单个查询（复用原有逻辑）
-                    process_single_query(query)
+                    try:
+                        data = json.loads(line)
+                        query = data.get('query')
+                        if not query:
+                            print(f"第{line_num}行缺少'query'字段，跳过", file=sys.stderr)
+                            save_progress(progress_file, line_num)
+                            pbar.update(1)
+                            continue
 
-                except json.JSONDecodeError:
-                    print(f"第{line_num}行JSON格式错误，跳过", file=sys.stderr)
+                        # 处理单个查询
+                        success = process_single_query(query)
+
+                        if success:
+                            save_progress(progress_file, line_num)
+                            pbar.update(1)
+                        else:
+                            print(f"第{line_num}行处理失败，将在下次运行时重试", file=sys.stderr)
+                            sys.exit(1)
+
+                    except json.JSONDecodeError:
+                        print(f"第{line_num}行JSON格式错误，跳过", file=sys.stderr)
+                        save_progress(progress_file, line_num)
+                        pbar.update(1)
+                    except Exception as e:
+                        print(f"第{line_num}行处理时发生错误: {str(e)}", file=sys.stderr)
+                        print(f"将在下次运行时从第{line_num}行重试", file=sys.stderr)
+                        sys.exit(1)
+
+        # 所有行处理完毕，删除进度文件
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
 
     except FileNotFoundError:
         print(f"文件不存在: {jsonl_path}", file=sys.stderr)
