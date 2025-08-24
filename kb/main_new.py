@@ -2,6 +2,7 @@ import sys
 import json
 import requests
 from datetime import datetime
+from time import sleep
 
 # 配置信息集中管理
 CONFIG = {
@@ -341,19 +342,42 @@ def process_items(items, segments, segments2file):
             segments2file[content] = get_filename_by_block_id(block_id)
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("请提供查询参数", file=sys.stderr)
-        sys.exit(1)
+def append_to_jsonl(file_path, data):
+    """
+    向JSONL文件添加一行数据
 
-    query = sys.argv[1]
+    参数:
+        file_path (str): JSONL文件路径
+        data (dict): 要添加的数据，必须是可序列化为JSON的字典
+    """
+    try:
+        # 以追加模式打开文件，确保中文等特殊字符正确处理
+        with open(file_path, 'a', encoding='utf-8') as f:
+            # 将数据序列化为JSON字符串并写入，确保不添加多余空格
+            json.dump(data, f, ensure_ascii=False)
+            # 写入换行符，确保每条记录占一行
+            f.write('\n')
+        print(f"成功向{file_path}添加一行数据")
+    except Exception as e:
+        print(f"操作失败: {str(e)}")
 
+
+# 新增：单独处理单个查询的函数（提取原有逻辑）
+def process_single_query(query, output_dir='output'):
     # 1. 查询重写
-    new_query = query_rewrite(query)
-    if not new_query:
+    success = False
+    for i in range(10):
+        new_query = query_rewrite(query)
+        if not new_query:
+            print(f"查询优化失败，无法继续:{new_query}", file=sys.stderr)
+            sleep(i)
+        else:
+            success = True
+            break
+
+    if not success:
         print("查询优化失败，无法继续", file=sys.stderr)
         sys.exit(1)
-
     # 2. 文本向量化
     vectors = vectorize_text([new_query])
     if not vectors or 'data' not in vectors or not vectors['data']:
@@ -366,18 +390,39 @@ def main():
     segments2file = {}
 
     # 4. 第一阶段：sentence级检索→转换为segment
+    sentence_recall_result={'query':query ,'query_rewritten': new_query,'value':[]}
     sentence_results = search_elasticsearch(query_vector, new_query)
     if sentence_results and isinstance(sentence_results, list):
         for hit in sentence_results:
             if not isinstance(hit, dict) or 'segment_id' not in hit or 'dir_id' not in hit:
                 print(f"无效的sentence结果: {hit}，跳过处理", file=sys.stderr)
                 continue
+
             segment_result = query_es_by_segment_id(hit['segment_id'], hit['dir_id'])
+
             process_items(segment_result, segments, segments2file)
+            item = {'sentence': hit['content'], 'sentence_score':hit['score'] ,
+                    'segment':segment_result[0]['content'],
+                    'segment_score':segment_result[0]['score'],
+                    'file_name': segments2file[segment_result[0]['content']]}
+            sentence_recall_result['value'].append(item)
+    # 按照sentence_score降序排列，如果需要按segment_score排序可以替换键
+    sentence_recall_result['value'].sort(key=lambda x: x['sentence_score'], reverse=True)
+    append_to_jsonl(f'{output_dir}/sentence_recall_result.jsonl', sentence_recall_result)
+
 
     # 5. 第二阶段：直接检索segments
+    segment_recall_result={'query':query ,'query_rewritten': new_query,'value':[]}
     direct_segment_results = search_segments_from_elasticsearch(query_vector, new_query)
     process_items(direct_segment_results, segments, segments2file)
+    for hit in direct_segment_results:
+        item = {'segment':hit['content'],
+                'segment_score': hit['score'],
+                'file_name': segments2file[hit['content']]}
+        segment_recall_result['value'].append(item)
+    segment_recall_result['value'].sort(key=lambda x: x['segment_score'], reverse=True)
+    append_to_jsonl(f'{output_dir}/segment_recall_result.jsonl', segment_recall_result)
+
 
     # 6. 重排序及结果整理
     if not segments:
@@ -385,10 +430,20 @@ def main():
         sys.exit(1)
 
     docs = list(segments)
-    rerank_result = call_rerank_api(new_query, docs)
-    if not rerank_result or 'data' not in rerank_result or not rerank_result['data']:
+    success = False
+    for i in range(10):
+        rerank_result = call_rerank_api(new_query, docs)
+        if not rerank_result or 'data' not in rerank_result or not rerank_result['data']:
+            print("重排序失败，retry", file=sys.stderr)
+            sleep(i)
+        else:
+            success = True
+            break
+
+    if not success:
         print("重排序失败，无法继续", file=sys.stderr)
         sys.exit(1)
+
 
     scores_with_index = rerank_result["data"][0]["value"]
     docs_with_scores = []
@@ -413,12 +468,48 @@ def main():
 
     # 输出结果
     result = {
-        'orig_query': query,
-        'new_query': new_query,
-        'retrieved_docs': sorted_docs
+        'query': query,
+        'query_rewritten': new_query,
+        'value': sorted_docs
     }
+
+    append_to_jsonl(f'{output_dir}/rerank_result.jsonl', result)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
+
+def main():
+    if len(sys.argv) < 2:
+        print("请提供JSONL文件路径", file=sys.stderr)
+        sys.exit(1)
+
+    jsonl_path = sys.argv[1]
+    try:
+        # 读取JSONL文件
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    # 解析JSON行，假设每行包含"query"字段
+                    data = json.loads(line)
+                    query = data.get('query')
+                    if not query:
+                        print(f"第{line_num}行缺少'query'字段，跳过", file=sys.stderr)
+                        continue
+
+                    # 处理单个查询（复用原有逻辑）
+                    process_single_query(query)
+
+                except json.JSONDecodeError:
+                    print(f"第{line_num}行JSON格式错误，跳过", file=sys.stderr)
+
+    except FileNotFoundError:
+        print(f"文件不存在: {jsonl_path}", file=sys.stderr)
+        sys.exit(1)
+    except IOError as e:
+        print(f"文件读取错误: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
