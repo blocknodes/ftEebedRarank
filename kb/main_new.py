@@ -42,6 +42,149 @@ CONFIG = {
     }
 }
 
+def merge_sorted_lists(list1, list2):
+    """
+    合并两个按'score'键降序排列的字典列表
+
+    参数:
+        list1: 第一个按'score'降序排列的字典列表
+        list2: 第二个按'score'降序排列的字典列表
+
+    返回:
+        合并后的按'score'降序排列的字典列表
+    """
+    merged = []
+    i = j = 0
+
+    # 双指针遍历两个列表，比较并合并
+    while i < len(list1) and j < len(list2):
+        if list1[i]['relevance_score'] >= list2[j]['relevance_score']:
+            merged.append(list1[i])
+            i += 1
+        else:
+            merged.append(list2[j])
+            j += 1
+
+    # 添加剩余元素
+    while i < len(list1):
+        merged.append(list1[i])
+        i += 1
+
+    while j < len(list2):
+        merged.append(list2[j])
+        j += 1
+
+    return merged
+
+
+def query_elasticsearch(query_vector, query, size=20):
+    """
+    向Elasticsearch发送查询请求，不使用HTTPBasicAuth，使用当前时间戳
+
+    参数:
+        query_vector: 用于KNN搜索的向量
+        query: 用于匹配qna_title的查询字符串
+        size: 返回结果的数量，默认20
+
+    返回:
+        包含查询结果的字典，如果请求失败则返回None
+    """
+    # Elasticsearch配置
+    username = "elastic"
+    password = "8ktbepQdRJVWjw@B"  # 解码后的密码
+    es_host = "10.18.219.171:9200"
+    index_name = "qna-embedding-data-000001"
+
+    # 构建包含认证信息的完整请求URL
+    url = f"http://{username}:{password}@{es_host}/{index_name}/_search"
+
+    # 获取当前时间戳（毫秒级）
+    current_timestamp = int(datetime.now().timestamp() * 1000)
+
+    # 构建请求体
+    payload = {
+        "_source": {
+            "excludes": [
+                "qna_embedding"
+            ]
+        },
+        "knn": {
+            "k": 16,
+            "boost": 24,
+            "num_candidates": 100,
+            "field": "qna_embedding",
+            "query_vector": query_vector
+        },
+        "query": {
+            "bool": {
+                "filter": [
+                    {
+                        "bool": {
+                            "must": [
+                                {
+                                    "range": {
+                                        "effective_time": {
+                                            "lt": current_timestamp
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "expire_time": {
+                                            "gt": current_timestamp
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "must": [
+                    {
+                        "match": {
+                            "qna_title": {
+                                "query": query
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+        "size": size
+    }
+
+    # 设置请求头
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    try:
+        # 发送请求（不使用HTTPBasicAuth）
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers
+            # 移除了auth参数
+        )
+
+        # 检查响应状态
+        response.raise_for_status()
+
+        # 返回解析后的JSON数据
+        response_data = response.json()
+
+        result = []
+        for hit in response_data['hits']['hits']:
+            item = {'score': hit['_score'],
+                'qna_title': hit['_source']['qna_title'],
+                'qna_content': hit['_source']['qna_content']}
+            result.append(item)
+
+        return result
+    except requests.exceptions.RequestException as e:
+        print(f"请求发生错误: {e}")
+        return None
+
 def get_filename_by_block_id(target_block_id):
     """根据block_id从Elasticsearch获取文件名"""
     try:
@@ -418,12 +561,65 @@ def process_single_query(query, output_dir='output'):
     if not success:
         print("查询优化失败，无法继续", file=sys.stderr)
         return False  # 返回处理状态
+    new_query = query
+
+
     # 2. 文本向量化
     vectors = vectorize_text([new_query])
     if not vectors or 'data' not in vectors or not vectors['data']:
         print("向量转换失败，无法继续", file=sys.stderr)
         return False  # 返回处理状态
     query_vector = vectors['data'][0]['value']
+
+    # 3.1 qq搜索
+    qa_pair = query_elasticsearch(query_vector, new_query)
+    append_to_jsonl(f'{output_dir}/qa_recall_result.jsonl',
+        {'query':query ,'query_rewritten': new_query,'value':qa_pair})
+
+
+    docs = [item['qna_title']  for item in qa_pair]
+    success = False
+    for i in range(10):
+        rerank_result = call_rerank_api(new_query, docs)
+        if not rerank_result or 'data' not in rerank_result or not rerank_result['data']:
+            print("重排序失败，retry", file=sys.stderr)
+            sleep(i)
+        else:
+            success = True
+            break
+    if not success:
+        print("重排序失败，无法继续", file=sys.stderr)
+        return False  # 返回处理状态
+
+    ########整理结果
+    scores_with_index = rerank_result["data"][0]["value"]
+    docs_with_scores = []
+    for item in scores_with_index:
+        if not isinstance(item, dict) or 'index' not in item or 'relevance_score' not in item:
+            print(f"无效的重排序结果: {item}，跳过处理", file=sys.stderr)
+            continue
+
+        idx = item["index"]
+        if idx < 0 or idx >= len(docs):
+            print(f"无效的文档索引: {idx}，跳过处理", file=sys.stderr)
+            continue
+
+        docs_with_scores.append({
+            "qna_title": docs[idx],
+            "relevance_score": item["relevance_score"],
+            "qna_content": qa_pair[idx]['qna_content']
+        })
+
+    # 按相关性降序排列
+    sorted_qa = sorted(docs_with_scores, key=lambda x: x["relevance_score"], reverse=True)
+    # 输出结果
+    result = {
+        'query': query,
+        'query_rewritten': new_query,
+        'value': sorted_qa
+    }
+
+    append_to_jsonl(f'{output_dir}/rerank_qa_result.jsonl', result)
 
     # 3. 初始化存储结构
     segments = set()
@@ -517,6 +713,16 @@ def process_single_query(query, output_dir='output'):
     }
 
     append_to_jsonl(f'{output_dir}/rerank_result.jsonl', result)
+
+    ### merge and select
+    final_result = merge_sorted_lists(sorted_docs, sorted_qa)
+    result = {
+        'query': query,
+        'query_rewritten': new_query,
+        'value': final_result
+    }
+
+    append_to_jsonl(f'{output_dir}/final_result.jsonl', result)
     return True  # 处理成功
 
 
@@ -581,10 +787,7 @@ def main():
                         print(f"第{line_num}行JSON格式错误，跳过", file=sys.stderr)
                         save_progress(progress_file, line_num)
                         pbar.update(1)
-                    except Exception as e:
-                        print(f"第{line_num}行处理时发生错误: {str(e)}", file=sys.stderr)
-                        print(f"将在下次运行时从第{line_num}行重试", file=sys.stderr)
-                        sys.exit(1)
+
 
         # 所有行处理完毕，删除进度文件
         if os.path.exists(progress_file):
