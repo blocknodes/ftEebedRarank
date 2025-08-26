@@ -535,7 +535,7 @@ def process_single_query(query, output_dir='output'):
     )
 
     # 3.2 QA结果重排序（保持原有重试逻辑）
-    docs = [item['qna_title'] for item in qa_pair]
+    docs = [item['qna_title'] for item in qa_pair] if qa_pair else []
     success = False
     for i in range(10):
         rerank_result = call_rerank_api(new_query, docs)
@@ -692,76 +692,96 @@ def process_single_query(query, output_dir='output'):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("请提供JSONL文件路径", file=sys.stderr)
-        sys.exit(1)
+    # 支持两种模式：文件处理模式和单查询模式
+    if len(sys.argv) == 2 and not sys.argv[1].startswith('-'):
+        # 文件处理模式：python script.py input.jsonl
+        jsonl_path = sys.argv[1]
+        progress_file = f"{jsonl_path}.progress"
 
-    jsonl_path = sys.argv[1]
-    progress_file = f"{jsonl_path}.progress"
+        try:
+            # 计算总行数（仅非空行）
+            total_lines = count_total_lines(jsonl_path)
+            if total_lines == 0:
+                print("文件为空或无法读取", file=sys.stderr)
+                sys.exit(1)
 
-    try:
-        # 计算总行数（仅非空行）
-        total_lines = count_total_lines(jsonl_path)
-        if total_lines == 0:
-            print("文件为空或无法读取", file=sys.stderr)
-            sys.exit(1)
+            # 加载上次处理进度
+            start_line = load_progress(progress_file)
+            remaining_lines = total_lines - start_line
 
-        # 加载上次处理进度
-        start_line = load_progress(progress_file)
-        remaining_lines = total_lines - start_line
+            # 读取JSONL文件并显示进度条
+            with open(jsonl_path, 'r', encoding='utf-8') as f:
+                # 移动到上次处理的位置
+                for _ in range(start_line):
+                    if not f.readline():  # 如果文件已读完
+                        if os.path.exists(progress_file):
+                            os.remove(progress_file)
+                        sys.exit(0)
 
-        # 读取JSONL文件并显示进度条
-        with open(jsonl_path, 'r', encoding='utf-8') as f:
-            # 移动到上次处理的位置
-            for _ in range(start_line):
-                if not f.readline():  # 如果文件已读完
-                    if os.path.exists(progress_file):
-                        os.remove(progress_file)
-                    sys.exit(0)
-
-            # 初始化进度条
-            with tqdm(total=total_lines, initial=start_line, unit='行', desc='处理进度') as pbar:
-                for line_num, line in enumerate(f, start_line + 1):
-                    line = line.strip()
-                    if not line:
-                        # 空行也更新进度
-                        save_progress(progress_file, line_num)
-                        pbar.update(1)
-                        continue
-
-                    try:
-                        data = json.loads(line)
-                        query = data.get('query')
-                        if not query:
-                            print(f"第{line_num}行缺少'query'字段，跳过", file=sys.stderr)
+                # 初始化进度条
+                with tqdm(total=total_lines, initial=start_line, unit='行', desc='处理进度') as pbar:
+                    for line_num, line in enumerate(f, start_line + 1):
+                        line = line.strip()
+                        if not line:
+                            # 空行也更新进度
                             save_progress(progress_file, line_num)
                             pbar.update(1)
                             continue
 
-                        # 处理单个查询
-                        success = process_single_query(query)
+                        try:
+                            data = json.loads(line)
+                            query = data.get('query')
+                            if not query:
+                                print(f"第{line_num}行缺少'query'字段，跳过", file=sys.stderr)
+                                save_progress(progress_file, line_num)
+                                pbar.update(1)
+                                continue
 
-                        if success:
+                            # 处理单个查询
+                            success = process_single_query(query)
+
+                            if success:
+                                save_progress(progress_file, line_num)
+                                pbar.update(1)
+                            else:
+                                print(f"第{line_num}行处理失败，将在下次运行时重试", file=sys.stderr)
+                                sys.exit(1)
+
+                        except json.JSONDecodeError:
+                            print(f"第{line_num}行JSON格式错误，跳过", file=sys.stderr)
                             save_progress(progress_file, line_num)
                             pbar.update(1)
-                        else:
-                            print(f"第{line_num}行处理失败，将在下次运行时重试", file=sys.stderr)
-                            sys.exit(1)
 
-                    except json.JSONDecodeError:
-                        print(f"第{line_num}行JSON格式错误，跳过", file=sys.stderr)
-                        save_progress(progress_file, line_num)
-                        pbar.update(1)
+            # 所有行处理完毕，删除进度文件
+            if os.path.exists(progress_file):
+                os.remove(progress_file)
 
-        # 所有行处理完毕，删除进度文件
-        if os.path.exists(progress_file):
-            os.remove(progress_file)
+        except FileNotFoundError:
+            print(f"文件不存在: {jsonl_path}", file=sys.stderr)
+            sys.exit(1)
+        except IOError as e:
+            print(f"文件读取错误: {str(e)}", file=sys.stderr)
+            sys.exit(1)
 
-    except FileNotFoundError:
-        print(f"文件不存在: {jsonl_path}", file=sys.stderr)
-        sys.exit(1)
-    except IOError as e:
-        print(f"文件读取错误: {str(e)}", file=sys.stderr)
+    elif len(sys.argv) == 3 and sys.argv[1] in ['-q', '--query']:
+        # 单查询模式：python script.py -q "你的查询内容"
+        query = sys.argv[2]
+        print(f"处理查询: {query}")
+        success = process_single_query(query)
+        if success:
+            print("查询处理完成")
+            sys.exit(0)
+        else:
+            print("查询处理失败")
+            sys.exit(1)
+
+    else:
+        # 显示帮助信息
+        print("使用方法:")
+        print("1. 批量处理JSONL文件:")
+        print("   python script.py input.jsonl")
+        print("2. 处理单个查询:")
+        print("   python script.py -q \"你的查询内容\"")
         sys.exit(1)
 
 
