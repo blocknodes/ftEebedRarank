@@ -107,6 +107,10 @@ if __name__ == "__main__":
         total_rerank_hit1 = 0
         total_rerank_hit3 = 0
 
+        # 存储hit1和hit3的行号
+        hit1_line_numbers = []
+        hit3_line_numbers = []
+
         for line in file:
             line_number += 1
             line = line.strip()
@@ -139,6 +143,12 @@ if __name__ == "__main__":
                         )
                         total_rerank_hit1 += hit1
                         total_rerank_hit3 += hit3
+
+                        # 记录命中的行号
+                        if hit1:
+                            hit1_line_numbers.append(line_number)
+                        if hit3:
+                            hit3_line_numbers.append(line_number)
                 # 移除了"未找到query字段"的打印，只在有错误时输出
 
             except json.JSONDecodeError as e:
@@ -149,6 +159,13 @@ if __name__ == "__main__":
     segment_hit_rate = total_segment_hit / total_query if total_query > 0 else 0
     rerank_hit1_rate = total_rerank_hit1 / total_query if total_query > 0 else 0
     rerank_hit3_rate = total_rerank_hit3 / total_query if total_query > 0 else 0
+
+    # 保存hit1和hit3的行号到文件
+    with open(f"{args.outputdir}/hit1_line_numbers.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(map(str, hit1_line_numbers)))
+
+    with open(f"{args.outputdir}/hit3_line_numbers.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(map(str, hit3_line_numbers)))
 
     # 打印结果
     print("="*50)
@@ -164,6 +181,8 @@ if __name__ == "__main__":
     print("\n重排序结果:")
     print(f"  Hit@1 命中数: {total_rerank_hit1}")
     print(f"  Hit@1 命中率: {rerank_hit1_rate:.4f} ({rerank_hit1_rate*100:.2f}%)")
+    print(f"  Hit@1 行号已保存至: {args.outputdir}/hit1_line_numbers.txt")
     print(f"  Hit@3 命中数: {total_rerank_hit3}")
     print(f"  Hit@3 命中率: {rerank_hit3_rate:.4f} ({rerank_hit3_rate*100:.2f}%)")
+    print(f"  Hit@3 行号已保存至: {args.outputdir}/hit3_line_numbers.txt")
     print("="*50)

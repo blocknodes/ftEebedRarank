@@ -5,6 +5,7 @@ import requests
 from time import sleep
 from datetime import datetime
 from tqdm import tqdm  # 用于显示进度条
+import argparse  # 新增：导入argparse模块
 
 # 配置信息集中管理
 CONFIG = {
@@ -20,7 +21,8 @@ CONFIG = {
         "current_timestamp": int(datetime.now().timestamp() * 1000)
     },
     "rerank_api": {
-        "url": "https://inner-apisix-test.hisense.com/hiaii/rerank?user_key=nrnwhmx4tkejvdptecujmlq9eclpugw0",
+        "url": "http://10.19.98.208:4123/rerank",
+        #"url": "https://inner-apisix-test.hisense.com/hiaii/rerank?user_key=nrnwhmx4tkejvdptecujmlq9eclpugw0",
         "headers": {
             "Content-Type": "application/json",
             "Cookie": "BIGipServerPOOL_OCP_JUCLOUD_DEV80=!+tLUVeluJWXzlZLVZekhhPIyzDN0Vem6oMaHLCwK6cswdpAa2lBxosUP75seeZQfBYHlqA8nc+MiuYY="
@@ -231,21 +233,72 @@ def query_es_by_segment_id(segment_id, dir_id):
         return None
 
 
-def call_rerank_api(query, documents):
-    """调用重排序API对文档进行重新排序"""
+def perform_reranking(query, documents):
+    """
+    调用重排序API对文档进行重新排序并返回带分数的结果
+
+    参数:
+        query: 查询文本
+        documents: 待排序的文档列表
+
+    返回:
+        带相关性分数的文档列表，按分数降序排列
+        每个元素是包含"document"和"relevance_score"的字典
+    """
     try:
-        data = {"documents": documents, "query": query}
-        response = requests.post(
-            CONFIG['rerank_api']['url'],
-            headers=CONFIG['rerank_api']['headers'],
-            data=json.dumps(data)
-        )
-        response.raise_for_status()
-        return response.json()
+        # 最多尝试10次
+        for i in range(10):
+            data = {"documents": documents, "query": query}
+            response = requests.post(
+                CONFIG['rerank_api']['url'],
+                headers=CONFIG['rerank_api']['headers'],
+                data=json.dumps(data)
+            )
+            response.raise_for_status()
+            rerank_result = response.json()
+
+            if rerank_result and 'data' in rerank_result and rerank_result['data']:
+                # 处理重排序结果
+                scores_with_index = rerank_result["data"][0]["value"]
+                docs_with_scores = []
+
+                for item in scores_with_index:
+                    if not isinstance(item, dict) or 'index' not in item or 'relevance_score' not in item:
+                        print(f"无效的重排序结果: {item}，跳过处理", file=sys.stderr)
+                        continue
+
+                    idx = item["index"]
+                    if idx < 0 or idx >= len(documents):
+                        print(f"无效的文档索引: {idx}，跳过处理", file=sys.stderr)
+                        continue
+
+                    docs_with_scores.append({
+                        "document": documents[idx],
+                        "relevance_score": item["relevance_score"]
+                    })
+
+                # 按相关性降序排列并返回
+                return sorted(docs_with_scores, key=lambda x: x["relevance_score"], reverse=True)
+            elif rerank_result and 'scores' in rerank_result:
+                scores = rerank_result['scores']
+                docs_with_scores = []
+                for idx in range(len(scores)):
+                    docs_with_scores.append({
+                        "document": documents[idx],
+                        "relevance_score": scores[idx]
+                    })
+                # 按相关性降序排列并返回
+                return sorted(docs_with_scores, key=lambda x: x["relevance_score"], reverse=True)
+
+            print(f"重排序失败，重试 {i+1}/10", file=sys.stderr)
+            sleep(i)
+
+        print("重排序多次尝试失败", file=sys.stderr)
+        return None
 
     except requests.exceptions.RequestException as e:
         print(f"重排序请求错误: {e}", file=sys.stderr)
-    return None
+        return None
 
 
 def search_elasticsearch(query_vector, search_query, size=20):
@@ -479,8 +532,12 @@ def save_progress(progress_file, line_num):
         print(f"保存进度失败: {str(e)}", file=sys.stderr)
 
 
-def load_progress(progress_file):
+def load_progress(progress_file, load_progress_flag):
     """从文件加载上次处理进度"""
+    # 如果不加载进度，直接返回0
+    if not load_progress_flag:
+        return 0
+
     try:
         if os.path.exists(progress_file):
             with open(progress_file, 'r', encoding='utf-8') as f:
@@ -501,24 +558,25 @@ def count_total_lines(file_path):
         return 0
 
 
-def process_single_query(query, output_dir='output'):
+def process_single_query(query, output_dir='output', use_rewrite=True):
     """处理单个查询，返回处理是否成功"""
-    # 1. 查询重写（保持原有重试逻辑）
-    success = False
-    for i in range(10):
-        new_query = query_rewrite(query)
-        if not new_query:
-            print(f"查询优化失败，无法继续:{new_query}", file=sys.stderr)
+    # 1. 查询重写（根据参数决定是否启用）
+    new_query = query  # 默认使用原始查询
+    if use_rewrite:
+        success = False
+        for i in range(10):
+            rewritten = query_rewrite(query)
+            if rewritten:
+                new_query = rewritten
+                success = True
+                break
+            print(f"查询优化失败，重试 {i+1}/10", file=sys.stderr)
             sleep(i)
-        else:
-            success = True
-            break
 
-    if not success:
-        print("查询优化失败，无法继续", file=sys.stderr)
-        return False
+        if not success:
+            print("查询优化多次失败，将使用原始查询继续", file=sys.stderr)
+            new_query = query  # 回退到原始查询
 
-    new_query = query  # 保持原逻辑
 
     # 2. 文本向量化
     vectors = vectorize_text([new_query])
@@ -534,43 +592,23 @@ def process_single_query(query, output_dir='output'):
         {'query': query, 'query_rewritten': new_query, 'value': qa_pair}
     )
 
-    # 3.2 QA结果重排序（保持原有重试逻辑）
+    # 3.2 QA结果重排序 - 第一次调用重排序函数
     docs = [item['qna_title'] for item in qa_pair] if qa_pair else []
-    success = False
-    for i in range(10):
-        rerank_result = call_rerank_api(new_query, docs)
-        if not rerank_result or 'data' not in rerank_result or not rerank_result['data']:
-            print("重排序失败，retry", file=sys.stderr)
-            sleep(i)
-        else:
-            success = True
-            break
+    sorted_qa = perform_reranking(new_query, docs)
 
-    if not success:
-        print("重排序失败，无法继续", file=sys.stderr)
+    if not sorted_qa:
+        print("QA重排序失败，无法继续", file=sys.stderr)
         return False
 
-    # 整理QA重排序结果
-    scores_with_index = rerank_result["data"][0]["value"]
-    docs_with_scores = []
-    for item in scores_with_index:
-        if not isinstance(item, dict) or 'index' not in item or 'relevance_score' not in item:
-            print(f"无效的重排序结果: {item}，跳过处理", file=sys.stderr)
-            continue
-
-        idx = item["index"]
-        if idx < 0 or idx >= len(docs):
-            print(f"无效的文档索引: {idx}，跳过处理", file=sys.stderr)
-            continue
-
-        docs_with_scores.append({
-            "qna_title": docs[idx],
-            "relevance_score": item["relevance_score"],
-            "qna_content": qa_pair[idx]['qna_content']
-        })
-
-    # 按相关性降序排列
-    sorted_qa = sorted(docs_with_scores, key=lambda x: x["relevance_score"], reverse=True)
+    # 补充qna_content信息
+    for item in sorted_qa:
+        # 找到对应的qna_content
+        for qa in qa_pair:
+            if qa['qna_title'] == item['document']:
+                item['qna_content'] = qa['qna_content']
+                item['qna_title'] = item['document']  # 重命名键以保持一致性
+                del item['document']  # 删除临时键
+                break
 
     # 输出QA重排序结果
     result = {
@@ -629,47 +667,21 @@ def process_single_query(query, output_dir='output'):
         segment_recall_result['value'].sort(key=lambda x: x['segment_score'], reverse=True)
         append_to_jsonl(f'{output_dir}/segment_recall_result.jsonl', segment_recall_result)
 
-    # 7. 片段重排序（保持原有重试逻辑）
+    # 7. 片段重排序 - 第二次调用重排序函数
     if not segments:
         print("未检索到有效片段", file=sys.stderr)
         return False
 
     docs = list(segments)
-    success = False
-    for i in range(10):
-        rerank_result = call_rerank_api(new_query, docs)
-        if not rerank_result or 'data' not in rerank_result or not rerank_result['data']:
-            print("重排序失败，retry", file=sys.stderr)
-            sleep(i)
-        else:
-            success = True
-            break
+    sorted_docs = perform_reranking(new_query, docs)
 
-    if not success:
-        print("重排序失败，无法继续", file=sys.stderr)
+    if not sorted_docs:
+        print("片段重排序失败，无法继续", file=sys.stderr)
         return False
 
-    # 整理片段重排序结果
-    scores_with_index = rerank_result["data"][0]["value"]
-    docs_with_scores = []
-    for item in scores_with_index:
-        if not isinstance(item, dict) or 'index' not in item or 'relevance_score' not in item:
-            print(f"无效的重排序结果: {item}，跳过处理", file=sys.stderr)
-            continue
-
-        idx = item["index"]
-        if idx < 0 or idx >= len(docs):
-            print(f"无效的文档索引: {idx}，跳过处理", file=sys.stderr)
-            continue
-
-        docs_with_scores.append({
-            "document": docs[idx],
-            "relevance_score": item["relevance_score"],
-            "filename": segments2file.get(docs[idx], "未知文件名")
-        })
-
-    # 按相关性降序排列
-    sorted_docs = sorted(docs_with_scores, key=lambda x: x["relevance_score"], reverse=True)
+    # 补充文件名信息
+    for item in sorted_docs:
+        item['filename'] = segments2file.get(item['document'], "未知文件名")
 
     # 输出片段重排序结果
     result = {
@@ -692,10 +704,33 @@ def process_single_query(query, output_dir='output'):
 
 
 def main():
-    # 支持两种模式：文件处理模式和单查询模式
-    if len(sys.argv) == 2 and not sys.argv[1].startswith('-'):
-        # 文件处理模式：python script.py input.jsonl
-        jsonl_path = sys.argv[1]
+    # 使用argparse解析命令行参数
+    parser = argparse.ArgumentParser(description='处理查询并从Elasticsearch检索相关结果')
+
+    # 添加互斥组：要么处理文件，要么处理单个查询
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('input_file', nargs='?', help='包含查询的JSONL文件路径')
+    group.add_argument('-q', '--query', help='单个查询内容')
+
+    # 通用参数
+    parser.add_argument('-o', '--output', default='output',
+                      help='输出目录路径，默认为"output"')
+    parser.add_argument('--no-load-progress', action='store_true',
+                      help='不加载已有的进度文件，从头开始处理')
+    parser.add_argument('--use-rewrite', action='store_true', default=True,
+                      help='是否使用查询改写功能（默认启用）')
+    parser.add_argument('--no-rewrite', action='store_false', dest='use_rewrite',
+                      help='不使用查询改写功能')
+
+    # 解析参数
+    args = parser.parse_args()
+
+    # 确保输出目录存在
+    os.makedirs(args.output, exist_ok=True)
+
+    if args.input_file is not None:
+        # 文件处理模式
+        jsonl_path = args.input_file
         progress_file = f"{jsonl_path}.progress"
 
         try:
@@ -706,7 +741,7 @@ def main():
                 sys.exit(1)
 
             # 加载上次处理进度
-            start_line = load_progress(progress_file)
+            start_line = load_progress(progress_file, not args.no_load_progress)
             remaining_lines = total_lines - start_line
 
             # 读取JSONL文件并显示进度条
@@ -737,8 +772,8 @@ def main():
                                 pbar.update(1)
                                 continue
 
-                            # 处理单个查询
-                            success = process_single_query(query)
+                            # 处理单个查询，传入use_rewrite参数
+                            success = process_single_query(query, args.output, args.use_rewrite)
 
                             if success:
                                 save_progress(progress_file, line_num)
@@ -763,26 +798,17 @@ def main():
             print(f"文件读取错误: {str(e)}", file=sys.stderr)
             sys.exit(1)
 
-    elif len(sys.argv) == 3 and sys.argv[1] in ['-q', '--query']:
-        # 单查询模式：python script.py -q "你的查询内容"
-        query = sys.argv[2]
-        print(f"处理查询: {query}")
-        success = process_single_query(query)
+    elif args.query is not None:
+        # 单查询模式
+        print(f"处理查询: {args.query}")
+        # 处理单个查询，传入use_rewrite参数
+        success = process_single_query(args.query, args.output, args.use_rewrite)
         if success:
             print("查询处理完成")
             sys.exit(0)
         else:
             print("查询处理失败")
             sys.exit(1)
-
-    else:
-        # 显示帮助信息
-        print("使用方法:")
-        print("1. 批量处理JSONL文件:")
-        print("   python script.py input.jsonl")
-        print("2. 处理单个查询:")
-        print("   python script.py -q \"你的查询内容\"")
-        sys.exit(1)
 
 
 if __name__ == "__main__":
