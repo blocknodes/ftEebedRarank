@@ -145,7 +145,7 @@ def query_elasticsearch(query_vector, query, size=20):
                 'score': hit['_score'],
                 'qna_title': hit['_source']['qna_title'],
                 'qna_content': hit['_source']['qna_content'],
-                'file_name': hit['_source']['fileName']
+                'filename': hit['_source']['fileName']
             }
             result.append(item)
 
@@ -612,7 +612,7 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
             if qa['qna_title'] == item['document'] and 'used' not in qa:
                 item['qna_content'] = qa['qna_content']
                 item['qna_title'] = item['document']  # 重命名键以保持一致性
-                item['file_name'] = qa['file_name']
+                item['filename'] = qa['filename']
                 qa['used'] = True
                 del item['document']  # 删除临时键
                 break
@@ -649,7 +649,7 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
                 'sentence_score': hit['score'],
                 'segment': segment_result[0]['content'],
                 'segment_score': segment_result[0]['score'],
-                'file_name': segments2file[segment_result[0]['content']]
+                'filename': segments2file[segment_result[0]['content']]
             }
             sentence_recall_result['value'].append(item)
 
@@ -667,7 +667,7 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
             item = {
                 'segment': hit['content'],
                 'segment_score': hit['score'],
-                'file_name': segments2file.get(hit['content'], "未知文件名")
+                'filename': segments2file.get(hit['content'], "未知文件名")
             }
             segment_recall_result['value'].append(item)
 
