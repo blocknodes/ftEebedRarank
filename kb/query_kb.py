@@ -5,7 +5,7 @@ import requests
 from time import sleep
 from datetime import datetime
 from tqdm import tqdm  # 用于显示进度条
-import argparse  # 新增：导入argparse模块
+import argparse  # 导入argparse模块
 
 # 配置信息集中管理
 CONFIG = {
@@ -21,8 +21,9 @@ CONFIG = {
         "current_timestamp": int(datetime.now().timestamp() * 1000)
     },
     "rerank_api": {
-        "url": "http://10.19.98.208:4123/rerank",
-        #"url": "https://inner-apisix-test.hisense.com/hiaii/rerank?user_key=nrnwhmx4tkejvdptecujmlq9eclpugw0",
+        #"url": "http://10.19.98.208:4123/rerank",
+        #"url": "http://10.19.98.208:4911/rerank",
+        "url": "https://inner-apisix-test.hisense.com/hiaii/rerank?user_key=nrnwhmx4tkejvdptecujmlq9eclpugw0",
         "headers": {
             "Content-Type": "application/json",
             "Cookie": "BIGipServerPOOL_OCP_JUCLOUD_DEV80=!+tLUVeluJWXzlZLVZekhhPIyzDN0Vem6oMaHLCwK6cswdpAa2lBxosUP75seeZQfBYHlqA8nc+MiuYY="
@@ -43,6 +44,7 @@ CONFIG = {
         }
     }
 }
+
 
 
 def merge_sorted_lists(list1, list2):
@@ -142,7 +144,8 @@ def query_elasticsearch(query_vector, query, size=20):
             item = {
                 'score': hit['_score'],
                 'qna_title': hit['_source']['qna_title'],
-                'qna_content': hit['_source']['qna_content']
+                'qna_content': hit['_source']['qna_content'],
+                'file_name': hit['_source']['fileName']
             }
             result.append(item)
 
@@ -233,7 +236,7 @@ def query_es_by_segment_id(segment_id, dir_id):
         return None
 
 
-def perform_reranking(query, documents):
+def perform_reranking(query, documents, extra_infos=None):
     """
     调用重排序API对文档进行重新排序并返回带分数的结果
 
@@ -249,6 +252,8 @@ def perform_reranking(query, documents):
         # 最多尝试10次
         for i in range(10):
             data = {"documents": documents, "query": query}
+            if extra_infos:
+                data = {"documents": [f"{item1}\n{item2}" for item1, item2 in zip(extra_infos,documents)], "query": query}
             response = requests.post(
                 CONFIG['rerank_api']['url'],
                 headers=CONFIG['rerank_api']['headers'],
@@ -604,9 +609,11 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
     for item in sorted_qa:
         # 找到对应的qna_content
         for qa in qa_pair:
-            if qa['qna_title'] == item['document']:
+            if qa['qna_title'] == item['document'] and 'used' not in qa:
                 item['qna_content'] = qa['qna_content']
                 item['qna_title'] = item['document']  # 重命名键以保持一致性
+                item['file_name'] = qa['file_name']
+                qa['used'] = True
                 del item['document']  # 删除临时键
                 break
 
@@ -673,6 +680,10 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
         return False
 
     docs = list(segments)
+    #docs_ext_infos = []
+    #for seg in segments:
+    #    docs_ext_infos.append(segments2file[seg])
+    #sorted_docs = perform_reranking(new_query, docs, docs_ext_infos)
     sorted_docs = perform_reranking(new_query, docs)
 
     if not sorted_docs:
