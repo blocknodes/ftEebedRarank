@@ -148,7 +148,7 @@ def rerank_style_metrics(query, filenames, line, config):
     total_relevant = len(relevant_files)
 
     # 计算命中的相关文件
-    hit_files = [fn for fn in retrieved_files if fn in relevant_files]
+    hit_files = set(fn for fn in retrieved_files if fn in relevant_files)
     hits = len(hit_files)
 
     # 计算Hit@1、Hit@3、Hit@10
