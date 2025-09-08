@@ -77,7 +77,7 @@ def jsonl_to_query_dict(file_path):
 def save_metrics_to_json(metrics, output_path, topk):
     """将评估指标保存为JSON文件（新增topk字段标注）"""
     # 在指标中添加topk字段，明确当前评估使用的Top-K值
-    metrics_with_topk = {**metrics, "eval_topk": topk}
+    metrics_with_topk = {** metrics, "eval_topk": topk}
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(metrics_with_topk, f, ensure_ascii=False, indent=2)
 
@@ -156,17 +156,20 @@ def rerank_style_metrics(query, filenames, line, config, topk):
     hit_files = set(fn for fn in retrieved_files_topk if fn in relevant_files)
     hits = len(hit_files)
 
-    # 4. Hit@1/3/10仍基于全量结果（与原逻辑一致，不依赖Top-K）
+    # 4. 确定是否在Top-K中未命中
+    topk_miss = 1 if hits == 0 and total_relevant > 0 else 0
+
+    # 5. Hit@1/3/10仍基于全量结果（与原逻辑一致，不依赖Top-K）
     hit1 = 1 if any(fn in relevant_files for fn in retrieved_files_all[:1]) else 0
     hit3 = 1 if any(fn in relevant_files for fn in retrieved_files_all[:3]) else 0
     hit10 = 1 if any(fn in relevant_files for fn in retrieved_files_all[:10]) else 0
 
-    # 5. 基于Top-K计算Recall和Precision
+    # 6. 基于Top-K计算Recall和Precision
     denominator = min(total_relevant, total_retrieved_topk)
     recall = hits / denominator if denominator > 0 else 0
     precision = hits / total_retrieved_topk if total_retrieved_topk > 0 else 0
 
-    return hit1, hit3, hit10, recall, precision, total_relevant, total_retrieved_topk, hits
+    return hit1, hit3, hit10, recall, precision, total_relevant, total_retrieved_topk, hits, topk_miss
 
 # 特定重排序评估函数（新增topk参数传递）
 def rerank_metrics(query, filenames, line, topk):
@@ -229,13 +232,15 @@ def main():
     # 初始化基础召回指标和重排序指标
     for eval_type in included_types:
         if EVAL_CONFIG[eval_type]['type'] == 'basic':
-            metrics[eval_type] = {'hit': 0, 'total': 0}
+            metrics[eval_type] = {'hit': 0, 'total': 0, 'miss': 0, 'miss_lines': []}
         else:  # rerank类型
             metrics[eval_type] = {
                 'hit1': 0, 'hit3': 0, 'hit10': 0,
                 'recall': 0, 'precision': 0,
                 'rel_count': 0, 'ret_count': 0, 'hit_count': 0, 'denominator': 0,
                 'hit1_lines': [], 'hit3_lines': [], 'hit10_lines': [],
+                # 新增未命中相关字段
+                'topk_miss': 0, 'topk_miss_lines': [],
                 'total': 0
             }
 
@@ -281,9 +286,18 @@ def main():
                                     query_maps[eval_type][data['query']]
                                 )
                                 hit_func = globals()[config['hit_func']]
-                                metrics[eval_type]['hit'] += hit_func(
-                                    data['query'], filenames, line_data
-                                )
+                                hit_result = hit_func(data['query'], filenames, line_data)
+                                metrics[eval_type]['hit'] += hit_result
+
+                                # 记录未命中行号
+                                if hit_result == 0 and len(filenames) > 0:
+                                    metrics[eval_type]['miss'] += 1
+                                    metrics[eval_type]['miss_lines'].append({
+                                        'line_number': line_number,
+                                        'query': data['query'],
+                                        'expected_files': filenames
+                                    })
+
                             else:
                                 # 处理重排序指标（传递topk参数到评估函数）
                                 line_data = readers[eval_type].read_line(
@@ -291,7 +305,7 @@ def main():
                                 )
                                 metrics_func = globals()[config['metrics_func']]
                                 # 调用时传入args.topk，实现动态Top-K计算
-                                hit1, hit3, hit10, recall, precision, rel_count, ret_count, hit_count = metrics_func(
+                                hit1, hit3, hit10, recall, precision, rel_count, ret_count, hit_count, topk_miss = metrics_func(
                                     data['query'], filenames, line_data, args.topk
                                 )
 
@@ -305,6 +319,7 @@ def main():
                                 metrics[eval_type]['ret_count'] += ret_count  # 基于Top-K的检索数
                                 metrics[eval_type]['hit_count'] += hit_count  # 基于Top-K的命中数
                                 metrics[eval_type]['denominator'] += min(rel_count, ret_count)
+                                metrics[eval_type]['topk_miss'] += topk_miss
 
                                 # 记录命中行号
                                 if hit1:
@@ -314,12 +329,21 @@ def main():
                                 if hit10:
                                     metrics[eval_type]['hit10_lines'].append(line_number)
 
+                                # 记录Top-K未命中行号及详情
+                                if topk_miss:
+                                    metrics[eval_type]['topk_miss_lines'].append({
+                                        'line_number': line_number,
+                                        'query': data['query'],
+                                        'expected_files': filenames,
+                                        'retrieved_files_topk': [item[config.get('filename_key', 'filename')] for item in line_data['value'][:args.topk]]
+                                    })
+
             except json.JSONDecodeError as e:
                 print(f"Line {line_number}: JSON解析错误 - {str(e)}")
             except Exception as e:
                 print(f"Line {line_number}: 处理错误 - {str(e)}")
 
-    # 保存指标文件和命中行号（指标文件新增topk标注）
+    # 保存指标文件和命中/未命中行号（指标文件新增topk标注）
     for eval_type in included_types:
         # 保存命中行号文件（重排序类型专属）
         if EVAL_CONFIG[eval_type]['type'] == 'rerank':
@@ -327,6 +351,19 @@ def main():
                 line_file_path = f"{args.outputdir}/{eval_type}_{hit_type}_top{args.topk}_line_numbers.txt"
                 with open(line_file_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(map(str, metrics[eval_type][f"{hit_type}_lines"])))
+
+            # 保存Top-K未命中记录（详细信息）
+            miss_file_path = f"{args.outputdir}/{eval_type}_top{args.topk}_misses.jsonl"
+            with open(miss_file_path, "w", encoding="utf-8") as f:
+                for miss in metrics[eval_type]['topk_miss_lines']:
+                    f.write(json.dumps(miss, ensure_ascii=False) + "\n")
+
+        # 基础类型保存未命中记录
+        else:
+            miss_file_path = f"{args.outputdir}/{eval_type}_misses.jsonl"
+            with open(miss_file_path, "w", encoding="utf-8") as f:
+                for miss in metrics[eval_type]['miss_lines']:
+                    f.write(json.dumps(miss, ensure_ascii=False) + "\n")
 
         # 保存指标JSON文件（含topk字段）
         metric_file_path = f"{args.outputdir}/{eval_type}_top{args.topk}_metrics.json"
@@ -345,12 +382,14 @@ def main():
             cfg = metrics[eval_type]
             total = cfg['total']
             hit_rate = cfg['hit'] / total if total > 0 else 0.0
+            miss_rate = cfg['miss'] / total if total > 0 else 0.0
 
             print(f"{eval_type}:")
             print(f"  有效查询数: {total}")
-            print(f"  命中数: {cfg['hit']}")
-            print(f"  命中率: {hit_rate:.4f} ({hit_rate*100:.2f}%)")
+            print(f"  命中数: {cfg['hit']} ({hit_rate:.2%})")
+            print(f"  未命中数: {cfg['miss']} ({miss_rate:.2%})")
             print(f"  指标文件: {args.outputdir}/{eval_type}_top{args.topk}_metrics.json")
+            print(f"  未命中记录: {args.outputdir}/{eval_type}_misses.jsonl")
             print("-"*60)
 
     # 打印重排序结果（标注Top-K值）
@@ -363,12 +402,14 @@ def main():
             if total == 0:
                 hit1_rate = hit3_rate = hit10_rate = 0.0
                 avg_recall = avg_precision = 0.0
+                topk_miss_rate = 0.0
             else:
                 hit1_rate = cfg['hit1'] / total
                 hit3_rate = cfg['hit3'] / total
                 hit10_rate = cfg['hit10'] / total
                 avg_recall = cfg['recall'] / total  # 基于Top-K的平均召回率
                 avg_precision = cfg['precision'] / total  # 基于Top-K的平均精确率
+                topk_miss_rate = cfg['topk_miss'] / total  # Top-K未命中率
 
             # 总体指标（基于Top-K）
             overall_recall = cfg['hit_count'] / cfg['denominator'] if cfg['denominator'] > 0 else 0
@@ -379,6 +420,7 @@ def main():
             print(f"  总相关文件数: {cfg['rel_count']}")
             print(f"  总Top-{args.topk}检索文件数: {cfg['ret_count']}")
             print(f"  总Top-{args.topk}命中文件数: {cfg['hit_count']}")
+            print(f"  Top-{args.topk}未命中数: {cfg['topk_miss']} ({topk_miss_rate:.2%})")
             print(f"  Hit@1: {cfg['hit1']} ({hit1_rate:.2%})")
             print(f"  Hit@3: {cfg['hit3']} ({hit3_rate:.2%})")
             print(f"  Hit@10: {cfg['hit10']} ({hit10_rate:.2%})")
@@ -388,6 +430,7 @@ def main():
             print(f"  总体精确率（Top-{args.topk}）: {overall_precision:.4f} ({overall_precision*100:.2f}%)")
             print(f"  指标文件: {args.outputdir}/{eval_type}_top{args.topk}_metrics.json")
             print(f"  命中行号文件: {args.outputdir}/{eval_type}_hit*_top{args.topk}_line_numbers.txt")
+            print(f"  Top-{args.topk}未命中记录: {args.outputdir}/{eval_type}_top{args.topk}_misses.jsonl")
             print("-"*60)
 
     print("\n" + "="*80)

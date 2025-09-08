@@ -36,7 +36,7 @@ CONFIG = {
     },
     "query_rewrite_apis": {
         "api1": {  # 原query_rewritten使用的API
-            "url": "http://10.19.98.208:4435/query_process",
+            "url": "http://10.19.98.208:4411/query_rewrite",
             "headers": {
                 "Content-Type": "application/json"
             }
@@ -83,7 +83,7 @@ def rewrite_query(original_query, api_name="api2"):
             # 解析API1返回结果
             if result.get("code") == 200 and "result" in result:
                 # 假设API1返回的是子查询列表，用空格连接
-                return result["result"][0]
+                return result["result"]
             else:
                 print(f"API1查询重写失败: {result.get('message', '未知错误')}", file=sys.stderr)
                 return original_query
@@ -616,152 +616,194 @@ def process_single_query(query, output_dir='output', use_rewrite=True, rewrite_a
     """处理单个查询，返回处理是否成功"""
     # 1. 查询重写（根据参数决定是否启用及使用哪个API）
     new_query = query  # 默认使用原始查询
+    new_querys = [query]  # 默认只有原始查询作为子查询
+
     if use_rewrite:
         success = False
         for i in range(10):
             rewritten = rewrite_query(query, rewrite_api)
-            if rewritten and rewritten['flag'] == 1:
-                new_query = rewritten['query']
+            if rewritten and rewritten['flag'] == 2:
+                new_querys = rewritten['queries']  # 获取子查询列表
                 success = True
                 break
             elif rewritten and rewritten['flag'] == 0:
-                # that is not a cool query, we need to return
-                print('问题不适合检索，已忽略！')
+                # 不适合检索的查询，直接返回
+                print('不检索，直接答！')
                 return True
-            print(f"查询优化失败，重试 {i+1}/10", file=sys.stderr)
+            elif rewritten and rewritten['flag'] == 1:
+                # 不适合检索的查询，直接返回
+                print('意图模糊拒绝答！')
+                return True
+            print(f"查询优化失败{rewritten}，重试 {i+1}/10", file=sys.stderr)
             sleep(i)
 
         if not success:
             print("查询优化多次失败，将使用原始查询继续", file=sys.stderr)
-            new_query = query  # 回退到原始查询
+            new_querys = [query]  # 回退到仅使用原始查询
 
+    # 收集所有子查询的召回结果
+    all_qa_pairs = []
+    all_segments = set()
+    all_segments2file = {}
+    all_sentence_results = []
+    all_direct_segment_results = []
 
-    # 2. 文本向量化
-    vectors = vectorize_text([new_query])
-    if not vectors or 'data' not in vectors or not vectors['data']:
-        print("向量转换失败，无法继续", file=sys.stderr)
-        return False
-    query_vector = vectors['data'][0]['value']
+    # 2. 对每个子查询执行召回操作
+    for sub_query in new_querys:
+        print(f"处理子查询: {sub_query}")
 
-    # 3.1 QA搜索
-    qa_pair = query_elasticsearch(query_vector, new_query)
-    append_to_jsonl(
-        f'{output_dir}/qa_recall_result.jsonl',
-        {'query': query, 'query_rewritten': new_query, 'rewrite_api_used': rewrite_api, 'value': qa_pair}
-    )
+        # 2.1 文本向量化（使用子查询生成向量）
+        vectors = vectorize_text([sub_query])
+        if not vectors or 'data' not in vectors or not vectors['data']:
+            print(f"子查询 '{sub_query}' 向量转换失败，跳过", file=sys.stderr)
+            continue
+        query_vector = vectors['data'][0]['value']
 
-    # 3.2 QA结果重排序 - 第一次调用重排序函数
-    docs = [item['qna_title'] for item in qa_pair] if qa_pair else []
-    sorted_qa = perform_reranking(new_query, docs)
+        # 2.2 QA搜索（使用子查询）
+        qa_pair = query_elasticsearch(query_vector, sub_query)
+        if qa_pair:
+            all_qa_pairs.extend(qa_pair)
+            # 记录子查询的QA召回结果
+            append_to_jsonl(
+                f'{output_dir}/qa_recall_result.jsonl',
+                {'query': query, 'sub_query': sub_query, 'query_rewritten': new_query,
+                 'rewrite_api_used': rewrite_api, 'value': qa_pair}
+            )
 
-    if not sorted_qa:
-        print("QA重排序失败，无法继续", file=sys.stderr)
-        return False
+        # 2.3 sentence级检索→转换为segment（使用子查询）
+        sentence_results = search_elasticsearch(query_vector, sub_query)
+        if sentence_results and isinstance(sentence_results, list):
+            for hit in sentence_results:
+                if not isinstance(hit, dict) or 'segment_id' not in hit or 'dir_id' not in hit:
+                    print(f"无效的sentence结果: {hit}，跳过处理", file=sys.stderr)
+                    continue
 
-    # 补充qna_content信息
-    for item in sorted_qa:
-        # 找到对应的qna_content
-        for qa in qa_pair:
-            if qa['qna_title'] == item['document'] and 'used' not in qa:
-                item['qna_content'] = qa['qna_content']
-                item['qna_title'] = item['document']  # 重命名键以保持一致性
-                item['filename'] = qa['filename']
-                qa['used'] = True
-                del item['document']  # 删除临时键
-                break
+                segment_result = query_es_by_segment_id(hit['segment_id'], hit['dir_id'])
+                if not segment_result:
+                    continue
 
-    # 输出QA重排序结果
-    result = {
-        'query': query,
-        'query_rewritten': new_query,
-        'rewrite_api_used': rewrite_api,
-        'value': sorted_qa
-    }
-    append_to_jsonl(f'{output_dir}/rerank_qa_result.jsonl', result)
+                process_items(segment_result, all_segments, all_segments2file)
+                item = {
+                    'sentence': hit['content'],
+                    'sentence_score': hit['score'],
+                    'segment': segment_result[0]['content'],
+                    'segment_score': segment_result[0]['score'],
+                    'filename': all_segments2file[segment_result[0]['content']],
+                    'sub_query': sub_query
+                }
+                all_sentence_results.append(item)
 
-    # 4. 初始化存储结构
-    segments = set()
-    segments2file = {}
+        # 2.4 直接检索segments（使用子查询）
+        direct_segment_results = search_segments_from_elasticsearch(query_vector, sub_query)
+        if direct_segment_results:
+            process_items(direct_segment_results, all_segments, all_segments2file)
+            for hit in direct_segment_results:
+                item = {
+                    'segment': hit['content'],
+                    'segment_score': hit['score'],
+                    'filename': all_segments2file.get(hit['content'], "未知文件名"),
+                    'sub_query': sub_query
+                }
+                all_direct_segment_results.append(item)
 
-    # 5. 第一阶段：sentence级检索→转换为segment
-    sentence_recall_result = {'query': query, 'query_rewritten': new_query, 'rewrite_api_used': rewrite_api, 'value': []}
-    sentence_results = search_elasticsearch(query_vector, new_query)
+        # 3. 处理sentence级检索结果（使用子查询信息）
+        if all_sentence_results:
+            # 按照sentence_score降序排列
+            all_sentence_results.sort(key=lambda x: x['sentence_score'], reverse=True)
+            append_to_jsonl(
+                f'{output_dir}/sentence_recall_result.jsonl',
+                {'query': query, 'sub_query': sub_query, 'rewrite_api_used': rewrite_api,
+                 'value': all_sentence_results}
+            )
 
-    if sentence_results and isinstance(sentence_results, list):
-        for hit in sentence_results:
-            if not isinstance(hit, dict) or 'segment_id' not in hit or 'dir_id' not in hit:
-                print(f"无效的sentence结果: {hit}，跳过处理", file=sys.stderr)
-                continue
+        # 4. 处理直接检索segments结果（使用子查询信息）
+        if all_direct_segment_results:
+            all_direct_segment_results.sort(key=lambda x: x['segment_score'], reverse=True)
+            append_to_jsonl(
+                f'{output_dir}/segment_recall_result.jsonl',
+                {'query': query, 'sub_query': sub_query, 'rewrite_api_used': rewrite_api,
+                 'value': all_direct_segment_results}
+            )
 
-            segment_result = query_es_by_segment_id(hit['segment_id'], hit['dir_id'])
-            if not segment_result:
-                continue
+    # 5. QA结果重排序 - 使用原始查询进行重排序
+    sorted_qa = []
+    if all_qa_pairs:
+        # 去重QA对
+        unique_qa_pairs = []
+        seen_titles = set()
+        for qa in all_qa_pairs:
+            if qa['qna_title'] not in seen_titles:
+                seen_titles.add(qa['qna_title'])
+                unique_qa_pairs.append(qa)
 
-            process_items(segment_result, segments, segments2file)
-            item = {
-                'sentence': hit['content'],
-                'sentence_score': hit['score'],
-                'segment': segment_result[0]['content'],
-                'segment_score': segment_result[0]['score'],
-                'filename': segments2file[segment_result[0]['content']]
-            }
-            sentence_recall_result['value'].append(item)
+        docs = [item['qna_title'] for item in unique_qa_pairs]
+        # 使用原始查询进行重排序
+        sorted_qa = perform_reranking(query, docs)
 
-    # 按照sentence_score降序排列
-    sentence_recall_result['value'].sort(key=lambda x: x['sentence_score'], reverse=True)
-    append_to_jsonl(f'{output_dir}/sentence_recall_result.jsonl', sentence_recall_result)
+        if not sorted_qa:
+            print("QA重排序失败，无法继续", file=sys.stderr)
+            return False
 
-    # 6. 第二阶段：直接检索segments
-    segment_recall_result = {'query': query, 'query_rewritten': new_query, 'rewrite_api_used': rewrite_api, 'value': []}
-    direct_segment_results = search_segments_from_elasticsearch(query_vector, new_query)
+        # 补充qna_content信息
+        for item in sorted_qa:
+            # 找到对应的qna_content
+            for qa in unique_qa_pairs:
+                if qa['qna_title'] == item['document'] and 'used' not in qa:
+                    item['qna_content'] = qa['qna_content']
+                    item['qna_title'] = item['document']  # 重命名键以保持一致性
+                    item['filename'] = qa['filename']
+                    qa['used'] = True
+                    del item['document']  # 删除临时键
+                    break
 
-    if direct_segment_results:
-        process_items(direct_segment_results, segments, segments2file)
-        for hit in direct_segment_results:
-            item = {
-                'segment': hit['content'],
-                'segment_score': hit['score'],
-                'filename': segments2file.get(hit['content'], "未知文件名")
-            }
-            segment_recall_result['value'].append(item)
+        # 输出QA重排序结果
+        result = {
+            'query': query,
+            'query_rewritten': new_query,
+            'rewrite_api_used': rewrite_api,
+            'value': sorted_qa
+        }
+        append_to_jsonl(f'{output_dir}/rerank_qa_result.jsonl', result)
 
-        segment_recall_result['value'].sort(key=lambda x: x['segment_score'], reverse=True)
-        append_to_jsonl(f'{output_dir}/segment_recall_result.jsonl', segment_recall_result)
-
-    # 7. 片段重排序 - 第二次调用重排序函数
-    if not segments:
+    # 6. 片段重排序 - 使用原始查询进行重排序
+    if not all_segments:
         print("未检索到有效片段", file=sys.stderr)
-        return False
+        # 如果也没有QA结果，则返回失败
+        if not sorted_qa:
+            return True
+    else:
+        docs = list(all_segments)
+        # 使用原始查询进行重排序
+        sorted_docs = perform_reranking(query, docs)
 
-    docs = list(segments)
-    sorted_docs = perform_reranking(new_query, docs)
+        if not sorted_docs:
+            print("片段重排序失败，无法继续", file=sys.stderr)
+            # 如果也没有QA结果，则返回失败
+            if not sorted_qa:
+                return False
 
-    if not sorted_docs:
-        print("片段重排序失败，无法继续", file=sys.stderr)
-        return False
+        # 补充文件名信息
+        for item in sorted_docs:
+            item['filename'] = all_segments2file.get(item['document'], "未知文件名")
 
-    # 补充文件名信息
-    for item in sorted_docs:
-        item['filename'] = segments2file.get(item['document'], "未知文件名")
+        # 输出片段重排序结果
+        result = {
+            'query': query,
+            'query_rewritten': new_query,
+            'rewrite_api_used': rewrite_api,
+            'value': sorted_docs
+        }
+        append_to_jsonl(f'{output_dir}/rerank_result.jsonl', result)
 
-    # 输出片段重排序结果
-    result = {
-        'query': query,
-        'query_rewritten': new_query,
-        'rewrite_api_used': rewrite_api,
-        'value': sorted_docs
-    }
-    append_to_jsonl(f'{output_dir}/rerank_result.jsonl', result)
-
-    # 8. 合并结果并输出最终结果
-    final_result = merge_sorted_lists(sorted_docs, sorted_qa)
-    result = {
-        'query': query,
-        'query_rewritten': new_query,
-        'rewrite_api_used': rewrite_api,
-        'value': final_result
-    }
-    append_to_jsonl(f'{output_dir}/final_result.jsonl', result)
+        # 7. 合并结果并输出最终结果
+        final_result = merge_sorted_lists(sorted_docs, sorted_qa)
+        result = {
+            'query': query,
+            'query_rewritten': new_query,
+            'rewrite_api_used': rewrite_api,
+            'value': final_result
+        }
+        append_to_jsonl(f'{output_dir}/final_result.jsonl', result)
 
     return True  # 处理成功
 
