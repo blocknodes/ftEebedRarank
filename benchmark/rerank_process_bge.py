@@ -81,16 +81,19 @@ def save_as_readable_jsonl(data, output_path):
 
 def main():
     # 检查命令行参数
-    if len(sys.argv) != 3:
-        print("用法: python reranker_processor.py <reranker模型路径> <输入JSONL文件路径>")
-        print("示例: python reranker_processor.py ./model ./input_data.jsonl")
+    if len(sys.argv) != 4:
+        print("用法: python reranker_processor.py <reranker模型路径> <输入JSONL文件路径> <输出文件前缀>")
+        print("示例: python reranker_processor.py ./model ./input_data.jsonl ./output/bge_reranker")
         sys.exit(1)
 
     # 解析命令行参数
     model_path = sys.argv[1]
     input_file_path = sys.argv[2]
-    standard_output_path = "./bge_reranker_standard.jsonl"  # 标准JSONL，用于程序处理
-    readable_output_path = "./bge_reranker_readable.jsonl"  # 易读JSONL，用于人工查看
+    output_prefix = sys.argv[3]  # 输出文件前缀
+
+    # 基于前缀生成输出路径
+    standard_output_path = f"{output_prefix}_standard.jsonl"  # 标准JSONL，用于程序处理
+    readable_output_path = f"{output_prefix}_readable.jsonl"  # 易读JSONL，用于人工查看
 
     # 加载输入数据
     print(f"加载数据: {input_file_path}")

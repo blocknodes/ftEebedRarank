@@ -3,7 +3,7 @@ import json
 from typing import List, Optional, Dict
 
 class RerankerClient:
-    def __init__(self, base_url: str = "http://aitc.hisense.com:4518"):
+    def __init__(self, base_url: str = "http://10.19.92.208:4268"):
         """
         初始化Qwen3-Reranker服务客户端
 
@@ -81,14 +81,17 @@ if __name__ == "__main__":
         queries.append(query)
         docs.append(records[i]['content'])
 
-
+    queries = ["<keyword>海信</keyword>海信的年度销售额是多少？","<keyword>海信</keyword>海信的年度销售额是多少？"]
+    docs=["<keyword>海尔</keyword>海尔的年度销售额是80亿","<keyword>海信</keyword>海信的年度销售额是80亿"]
+    #queries = ["海信的年度销售额是多少？","海信的年度销售额是多少？"]
+    docs=["海尔的年度销售额是80亿","海信的年度销售额是80亿"]
 
 ####
     # 调用rerank服务
     result = client.rerank(
         queries=queries,
         documents=docs,
-        #instruction=test_instruction
+        instruction=test_instruction
     )
 
     # 处理并展示结果

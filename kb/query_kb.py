@@ -21,8 +21,6 @@ CONFIG = {
         "current_timestamp": int(datetime.now().timestamp() * 1000)
     },
     "rerank_api": {
-        #"url": "http://10.19.98.208:4123/rerank",
-        #"url": "http://10.19.98.208:4911/rerank",
         "url": "https://inner-apisix-test.hisense.com/hiaii/rerank?user_key=nrnwhmx4tkejvdptecujmlq9eclpugw0",
         "headers": {
             "Content-Type": "application/json",
@@ -36,15 +34,154 @@ CONFIG = {
             "Cookie": "BIGipServerPOOL_OCP_JUCLOUD_DEV80=!kszdw5vSDwVhwpfVZekhhPIyzDN0VUEESYyjq+3xAIqTfo1X+BHgT2qyf7IFzzS3EKQEtuascy75His="
         }
     },
-    "query_rewrite_api": {
-        "url": "http://10.18.217.60:31975/v1/biz/completion",
-        "headers": {
-            "Content-Type": "application/json",
-            "accept": "application/json"
+    "query_rewrite_apis": {
+        "api1": {  # 原query_rewritten使用的API
+            "url": "http://10.19.98.208:4435/query_process",
+            "headers": {
+                "Content-Type": "application/json"
+            }
+        },
+        "api2": {  # 原query_rewrite使用的API
+            "url": "http://10.18.217.60:31975/v1/biz/completion",
+            "headers": {
+                "Content-Type": "application/json",
+                "accept": "application/json"
+            }
         }
     }
 }
 
+def rewrite_query(original_query, api_name="api2"):
+    """
+    统一的查询重写函数，通过api_name参数区分使用不同的API
+
+    参数:
+        original_query (str): 原始查询字符串
+        api_name (str): 要使用的API名称，可选值为"api1"或"api2"
+
+    返回:
+        str: 重写后的查询字符串
+    """
+    if api_name not in CONFIG["query_rewrite_apis"]:
+        raise ValueError(f"不支持的API名称: {api_name}，可选值为{list(CONFIG['query_rewrite_apis'].keys())}")
+
+    api_config = CONFIG["query_rewrite_apis"][api_name]
+
+    try:
+        if api_name == "api1":
+            # 使用第一个API进行查询重写
+            data = {"query": original_query}
+
+            response = requests.post(
+                url=api_config["url"],
+                headers=api_config["headers"],
+                data=json.dumps(data)
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            # 解析API1返回结果
+            if result.get("code") == 200 and "result" in result:
+                # 假设API1返回的是子查询列表，用空格连接
+                return result["result"][0]
+            else:
+                print(f"API1查询重写失败: {result.get('message', '未知错误')}", file=sys.stderr)
+                return original_query
+
+        elif api_name == "api2":
+            # 使用第二个API进行查询重写
+            prompt = """你是一个专业的搜索查询优化助手，也是一个精准、高效的关键词提取工具，需要将输入的核心关键词、重要的语义词提取出来，提取后的信息需符合搜索引擎的高效检索要求。
+
+            提取时请严格遵循以下要求：
+            1. **高度概括性**：关键词应能准确代表文本想表达的核心内容。
+            2. **信息承载性强**：保留重要实体，如专业术语、产品名、型号、功能描述、技术名词等。
+            3. **避免冗余和解释**：不输出无实际意义的词汇；不添加解释、注释或格式修饰，避免出现过于通用的关键词，例如：操作，功能。
+            4. **语言统一**：如原文为中文，则关键词用中文；如为英文则保持英文。
+            5. **提取规则**
+            - 产品型号（如WF100N2Q-6）
+            - 专有名词（公司/产品/法规名称）
+            - 重点关注文件名称的内容，其中包含了如产品型号、品牌名等重要信息
+            - 可以对关键词进行一定程度的改写，把口语化的内容变成专业化的表达
+            6. **必须删除的内容**
+            - 疑问词（"是否"/"怎样"）
+            - 主观描述（"惊人的"/"快速"）
+            - 模糊表述（"一些"/"多种"）
+            - 模棱两可的数据
+            - 没有主语的内容
+            7. **主题提取**：
+            - 根据输入内容预测可能属于的领域主题
+            8. **输出格式**：仅返回一个 JSON 对象，包含名为 `"keywords"` 的数组，数组中每个元素是一个关键词或短语。必须严格按照json格式输出
+
+            9. **输出示例1**：
+            ```
+            {"rewritten_query": ["关键词1", "关键词2", "关键词3"]}
+            ```
+
+            10. **输出示例2**：当输入为“怎么收费啊”
+            ```
+            {"rewritten_query": ["无主语"]}
+            ```
+
+            **你的任务**
+            现在请处理以下用户输入：{{QUERY}}"""
+
+            # 替换占位符
+            prompt = prompt.replace('{{QUERY}}', original_query)
+
+            data = {
+                "sceneType": "information_extract",
+                "model": "xinghai_aliyun_deepseek_v3",
+                "query": prompt,
+                "clientSid": "E43BC9B3AA27,1744167435980",
+                "deviceId": "861003009000002000000164c9b3aa27",
+                "stream": False,
+                "dialogueTurnsMax": 0,
+                "history": [],
+                "dynamicParam": {},
+                "modelAdvance": {
+                    "temperature": 0.7,
+                    "topP": 0.8,
+                    "maxTokens": 2048,
+                    "enableSearch": False
+                },
+                "riskRespType": "risk_words",
+                "skipInputCheck": True,
+                "skipOutputCheck": True,
+                "forceInternetFlag": False,
+                "enablePromptPrefix": False,
+                "searchRagPartition": None
+            }
+
+            response = requests.post(
+                url=api_config["url"],
+                headers=api_config["headers"],
+                data=json.dumps(data)
+            )
+            response.raise_for_status()
+            result = response.json()
+            message_content = result['choices'][0]['message']['content']
+
+            # 解析JSON内容
+            content_json = json.loads(message_content)
+            rewritten_queries = content_json.get('rewritten_query', [])
+
+            # 过滤"无主语"等无效结果
+            filtered_queries = [q for q in rewritten_queries if q != "无主语"]
+            if filtered_queries:
+                return " ".join(filtered_queries)
+            else:
+                print("API2未返回有效关键词", file=sys.stderr)
+                return original_query
+
+    except requests.exceptions.RequestException as e:
+        print(f"查询重写API请求失败: {str(e)}", file=sys.stderr)
+    except json.JSONDecodeError:
+        print("查询重写API返回内容不是有效的JSON", file=sys.stderr)
+        if 'response' in locals():
+            print("响应内容:", response.text, file=sys.stderr)
+
+    # 所有方法都失败时返回原始查询
+    return original_query
 
 
 def merge_sorted_lists(list1, list2):
@@ -143,7 +280,7 @@ def query_elasticsearch(query_vector, query, size=20):
         for hit in response_data['hits']['hits']:
             item = {
                 'score': hit['_score'],
-                'qna_title': hit['_source']['qna_title'],
+                'qna_title': str(hit['_source']['qna_title']),
                 'qna_content': hit['_source']['qna_content'],
                 'filename': hit['_source']['fileName']
             }
@@ -397,94 +534,6 @@ def vectorize_text(docs):
         return None
 
 
-def query_rewrite(query):
-    """优化查询语句，提取关键词"""
-    prompt = """你是一个专业的搜索查询优化助手，也是一个精准、高效的关键词提取工具，需要将输入的核心关键词、重要的语义词提取出来，提取后的信息需符合搜索引擎的高效检索要求。
-
-    提取时请严格遵循以下要求：
-    1. **高度概括性**：关键词应能准确代表文本想表达的核心内容。
-    2. **信息承载性强**：保留重要实体，如专业术语、产品名、型号、功能描述、技术名词等。
-    3. **避免冗余和解释**：不输出无实际意义的词汇；不添加解释、注释或格式修饰，避免出现过于通用的关键词，例如：操作，功能。
-    4. **语言统一**：如原文为中文，则关键词用中文；如为英文则保持英文。
-    5. **提取规则**
-    - 产品型号（如WF100N2Q-6）
-    - 专有名词（公司/产品/法规名称）
-    - 重点关注文件名称的内容，其中包含了如产品型号、品牌名等重要信息
-    - 可以对关键词进行一定程度的改写，把口语化的内容变成专业化的表达
-    6. **必须删除的内容**
-    - 疑问词（"是否"/"怎样"）
-    - 主观描述（"惊人的"/"快速"）
-    - 模糊表述（"一些"/"多种"）
-    - 模棱两可的数据
-    - 没有主语的内容
-    7. **主题提取**：
-    - 根据输入内容预测可能属于的领域主题
-    8. **输出格式**：仅返回一个 JSON 对象，包含名为 `"keywords"` 的数组，数组中每个元素是一个关键词或短语。必须严格按照json格式输出
-
-    9. **输出示例1**：
-    ```
-    {"rewritten_query": ["关键词1", "关键词2", "关键词3"]}
-    ```
-
-    10. **输出示例2**：当输入为“怎么收费啊”
-    ```
-    {"rewritten_query": ["无主语"]}
-    ```
-
-    **你的任务**
-    现在请处理以下用户输入：{{QUERY}}"""
-
-    # 替换占位符
-    prompt = prompt.replace('{{QUERY}}', query)
-
-    try:
-        data = {
-            "sceneType": "information_extract",
-            "model": "xinghai_aliyun_deepseek_v3",
-            "query": prompt,
-            "clientSid": "E43BC9B3AA27,1744167435980",
-            "deviceId": "861003009000002000000164c9b3aa27",
-            "stream": False,
-            "dialogueTurnsMax": 0,
-            "history": [],
-            "dynamicParam": {},
-            "modelAdvance": {
-                "temperature": 0.7,
-                "topP": 0.8,
-                "maxTokens": 2048,
-                "enableSearch": False
-            },
-            "riskRespType": "risk_words",
-            "skipInputCheck": True,
-            "skipOutputCheck": True,
-            "forceInternetFlag": False,
-            "enablePromptPrefix": False,
-            "searchRagPartition": None
-        }
-
-        response = requests.post(
-            CONFIG['query_rewrite_api']['url'],
-            headers=CONFIG['query_rewrite_api']['headers'],
-            data=json.dumps(data)
-        )
-        response.raise_for_status()
-        result = response.json()
-        message_content = result['choices'][0]['message']['content']
-
-        # 解析JSON内容
-        content_json = json.loads(message_content)
-        rewritten_queries = content_json.get('rewritten_query', [])
-
-        return " ".join(rewritten_queries)
-
-    except requests.exceptions.RequestException as e:
-        print(f"查询重写请求失败: {e}", file=sys.stderr)
-    except json.JSONDecodeError:
-        print("响应内容不是有效的JSON", file=sys.stderr)
-        print("响应内容:", response.text, file=sys.stderr)
-    return None
-
-
 def process_items(items, segments, segments2file):
     """处理检索结果条目，过滤无效数据并提取segment信息"""
     if not isinstance(items, list):
@@ -563,18 +612,22 @@ def count_total_lines(file_path):
         return 0
 
 
-def process_single_query(query, output_dir='output', use_rewrite=True):
+def process_single_query(query, output_dir='output', use_rewrite=True, rewrite_api="api2"):
     """处理单个查询，返回处理是否成功"""
-    # 1. 查询重写（根据参数决定是否启用）
+    # 1. 查询重写（根据参数决定是否启用及使用哪个API）
     new_query = query  # 默认使用原始查询
     if use_rewrite:
         success = False
         for i in range(10):
-            rewritten = query_rewrite(query)
-            if rewritten:
-                new_query = rewritten
+            rewritten = rewrite_query(query, rewrite_api)
+            if rewritten and rewritten['flag'] == 1:
+                new_query = rewritten['query']
                 success = True
                 break
+            elif rewritten and rewritten['flag'] == 0:
+                # that is not a cool query, we need to return
+                print('问题不适合检索，已忽略！')
+                return True
             print(f"查询优化失败，重试 {i+1}/10", file=sys.stderr)
             sleep(i)
 
@@ -594,7 +647,7 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
     qa_pair = query_elasticsearch(query_vector, new_query)
     append_to_jsonl(
         f'{output_dir}/qa_recall_result.jsonl',
-        {'query': query, 'query_rewritten': new_query, 'value': qa_pair}
+        {'query': query, 'query_rewritten': new_query, 'rewrite_api_used': rewrite_api, 'value': qa_pair}
     )
 
     # 3.2 QA结果重排序 - 第一次调用重排序函数
@@ -621,6 +674,7 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
     result = {
         'query': query,
         'query_rewritten': new_query,
+        'rewrite_api_used': rewrite_api,
         'value': sorted_qa
     }
     append_to_jsonl(f'{output_dir}/rerank_qa_result.jsonl', result)
@@ -630,7 +684,7 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
     segments2file = {}
 
     # 5. 第一阶段：sentence级检索→转换为segment
-    sentence_recall_result = {'query': query, 'query_rewritten': new_query, 'value': []}
+    sentence_recall_result = {'query': query, 'query_rewritten': new_query, 'rewrite_api_used': rewrite_api, 'value': []}
     sentence_results = search_elasticsearch(query_vector, new_query)
 
     if sentence_results and isinstance(sentence_results, list):
@@ -658,7 +712,7 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
     append_to_jsonl(f'{output_dir}/sentence_recall_result.jsonl', sentence_recall_result)
 
     # 6. 第二阶段：直接检索segments
-    segment_recall_result = {'query': query, 'query_rewritten': new_query, 'value': []}
+    segment_recall_result = {'query': query, 'query_rewritten': new_query, 'rewrite_api_used': rewrite_api, 'value': []}
     direct_segment_results = search_segments_from_elasticsearch(query_vector, new_query)
 
     if direct_segment_results:
@@ -680,10 +734,6 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
         return False
 
     docs = list(segments)
-    #docs_ext_infos = []
-    #for seg in segments:
-    #    docs_ext_infos.append(segments2file[seg])
-    #sorted_docs = perform_reranking(new_query, docs, docs_ext_infos)
     sorted_docs = perform_reranking(new_query, docs)
 
     if not sorted_docs:
@@ -698,6 +748,7 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
     result = {
         'query': query,
         'query_rewritten': new_query,
+        'rewrite_api_used': rewrite_api,
         'value': sorted_docs
     }
     append_to_jsonl(f'{output_dir}/rerank_result.jsonl', result)
@@ -707,6 +758,7 @@ def process_single_query(query, output_dir='output', use_rewrite=True):
     result = {
         'query': query,
         'query_rewritten': new_query,
+        'rewrite_api_used': rewrite_api,
         'value': final_result
     }
     append_to_jsonl(f'{output_dir}/final_result.jsonl', result)
@@ -732,6 +784,8 @@ def main():
                       help='是否使用查询改写功能（默认启用）')
     parser.add_argument('--no-rewrite', action='store_false', dest='use_rewrite',
                       help='不使用查询改写功能')
+    parser.add_argument('--rewrite-api', choices=['api1', 'api2'], default='api1',
+                      help='选择查询重写使用的API，可选值为api1或api2（默认api2）')
 
     # 解析参数
     args = parser.parse_args()
@@ -783,8 +837,13 @@ def main():
                                 pbar.update(1)
                                 continue
 
-                            # 处理单个查询，传入use_rewrite参数
-                            success = process_single_query(query, args.output, args.use_rewrite)
+                            # 处理单个查询，传入use_rewrite和rewrite_api参数
+                            success = process_single_query(
+                                query,
+                                args.output,
+                                args.use_rewrite,
+                                args.rewrite_api
+                            )
 
                             if success:
                                 save_progress(progress_file, line_num)
@@ -811,9 +870,14 @@ def main():
 
     elif args.query is not None:
         # 单查询模式
-        print(f"处理查询: {args.query}")
-        # 处理单个查询，传入use_rewrite参数
-        success = process_single_query(args.query, args.output, args.use_rewrite)
+        print(f"处理查询: {args.query}，使用查询重写API: {args.rewrite_api}")
+        # 处理单个查询，传入use_rewrite和rewrite_api参数
+        success = process_single_query(
+            args.query,
+            args.output,
+            args.use_rewrite,
+            args.rewrite_api
+        )
         if success:
             print("查询处理完成")
             sys.exit(0)
