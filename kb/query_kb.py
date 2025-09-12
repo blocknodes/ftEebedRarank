@@ -21,7 +21,10 @@ CONFIG = {
         "current_timestamp": int(datetime.now().timestamp() * 1000)
     },
     "rerank_api": {
-        "url": "https://inner-apisix-test.hisense.com/hiaii/rerank?user_key=nrnwhmx4tkejvdptecujmlq9eclpugw0",
+        #"url": "https://inner-apisix-test.hisense.com/hiaii/rerank?user_key=nrnwhmx4tkejvdptecujmlq9eclpugw0",
+        "url": "http://localhost:8080/rerank",
+        #"url": "http://10.19.98.208:4123/rerank",
+
         "headers": {
             "Content-Type": "application/json",
             "Cookie": "BIGipServerPOOL_OCP_JUCLOUD_DEV80=!+tLUVeluJWXzlZLVZekhhPIyzDN0Vem6oMaHLCwK6cswdpAa2lBxosUP75seeZQfBYHlqA8nc+MiuYY="
@@ -612,7 +615,7 @@ def count_total_lines(file_path):
         return 0
 
 
-def process_single_query(query, output_dir='output', use_rewrite=True, rewrite_api="api2"):
+def process_single_query(query, output_dir='output', use_rewrite=True, rewrite_api="api2", concat_filename=False):
     """处理单个查询，返回处理是否成功"""
     # 1. 查询重写（根据参数决定是否启用及使用哪个API）
     new_query = query  # 默认使用原始查询
@@ -734,7 +737,8 @@ def process_single_query(query, output_dir='output', use_rewrite=True, rewrite_a
         return False
 
     docs = list(segments)
-    sorted_docs = perform_reranking(new_query, docs)
+    extra_info = [segments2file[doc] for doc in docs] if concat_filename else None
+    sorted_docs = perform_reranking(new_query, docs, extra_info)
 
     if not sorted_docs:
         print("片段重排序失败，无法继续", file=sys.stderr)
@@ -786,6 +790,8 @@ def main():
                       help='不使用查询改写功能')
     parser.add_argument('--rewrite-api', choices=['api1', 'api2'], default='api1',
                       help='选择查询重写使用的API，可选值为api1或api2（默认api2）')
+    parser.add_argument('--concat-filename', action='store_true',
+                      help='强制拼接filename到文档中（覆盖配置文件设置）')
 
     # 解析参数
     args = parser.parse_args()
@@ -842,7 +848,8 @@ def main():
                                 query,
                                 args.output,
                                 args.use_rewrite,
-                                args.rewrite_api
+                                args.rewrite_api,
+                                args.concat_filename
                             )
 
                             if success:
@@ -876,7 +883,8 @@ def main():
             args.query,
             args.output,
             args.use_rewrite,
-            args.rewrite_api
+            args.rewrite_api,
+            args.concat_filename
         )
         if success:
             print("查询处理完成")
