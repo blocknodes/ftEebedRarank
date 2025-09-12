@@ -7,6 +7,11 @@ def after_first_newline(s):
     parts = s.split('\n', 1)
     return parts[1] if len(parts) > 1 else ""
 
+def get_first_line(s):
+    """获取字符串的第一行，作为标题"""
+    parts = s.split('\n', 1)
+    return parts[0] if parts else ""
+
 def evaluate_retrieval_performance(data, output_dir, score_threshold=0.0):
     """评估召回内容的 Top1、Top3 命中率以及 MRR，支持过滤低于阈值的结果"""
     top1_hits = 0
@@ -52,16 +57,24 @@ def evaluate_retrieval_performance(data, output_dir, score_threshold=0.0):
             filtered_recalls = retrieved_docs
             filtered_scores = [None] * len(retrieved_docs)
 
-        pos = []
-        recall_with_scores = []  # 包含分数的召回结果（仅保留此信息）
+        pos = []  # 存储包含标题和内容的相关文档字典
+        recall_with_scores = []  # 包含分数的召回结果
 
+        # 处理相关文档，将标题和内容整合到字典中
         for doc in relevant_docs:
-            pos.append(after_first_newline(doc)+'\n')
+            content = after_first_newline(doc) + '\n'
+            title = get_first_line(doc)
+            pos.append({
+                "title": title,
+                "content": content
+            })
 
-        # 处理召回结果，仅生成带分数的版本
+        # 处理召回结果，生成带分数和标题的版本
         for doc, score in zip(filtered_recalls, filtered_scores):
+            doc_title = get_first_line(doc)
             doc_content = after_first_newline(doc)
             recall_with_scores.append({
+                "title": doc_title,
                 "content": doc_content,
                 "score": score
             })
@@ -71,9 +84,10 @@ def evaluate_retrieval_performance(data, output_dir, score_threshold=0.0):
 
         total_queries += 1
 
-        # 计算 Top1 命中
+        # 计算 Top1 命中（只使用content进行匹配）
         top1_hit = 0
-        pos_texts = [p.replace(' ', '') for p in pos]
+        # 提取所有相关文档的content用于匹配检查
+        pos_texts = [p["content"].replace(' ', '') for p in pos]
         if recall_with_scores:  # 检查召回结果是否为空
             first_recall = recall_with_scores[0]["content"].replace(' ', '')
             if first_recall in pos_texts:
